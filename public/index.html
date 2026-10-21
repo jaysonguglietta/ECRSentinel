@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1220">
+    <title>ECR Sentinel · Local container vulnerability scans</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <svg class="icon-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.5 20 6v5.7c0 5-3.2 8.6-8 10-4.8-1.4-8-5-8-10V6l8-3.5Z"/><path d="m9 12 2 2 4-4"/></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 17l9 5 9-5"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="7"/><path d="m16 16 5 5"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-5L3 9m0-6v6h6M4 13a8 8 0 0 0 14 5l3-3m0 6v-6h-6"/></symbol>
+      <symbol id="i-alert" viewBox="0 0 24 24"><path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3h.01"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M5 5 19 19M19 5 5 19"/></symbol>
+      <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M4 17v4h16v-4"/></symbol>
+      <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6m0-6-9 9"/><path d="M20 14v6H4V4h6"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="2.5" y="3.5" width="19" height="17" rx="2"/><path d="m6 9 3 3-3 3m6 0h6"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></symbol>
+      <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4m6 0h4a1 1 0 0 1 1 1v4m0 6v4a1 1 0 0 1-1 1h-4m-6 0H5a1 1 0 0 1-1-1v-4M3 12h18"/></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path d="m12 2 9 5-9 5-9-5 9-5ZM3 7v10l9 5 9-5V7M12 12v10"/></symbol>
+      <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+      <symbol id="i-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v5l-4 2v-7L3 5Z"/></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Repository navigation">
+        <div class="brand-row">
+          <div class="brand-mark"><svg><use href="#i-shield"></use></svg></div>
+          <div class="brand-copy"><strong>ECR Sentinel</strong><span>Image security</span></div>
+          <button class="icon-button mobile-only" id="closeSidebar" type="button" aria-label="Close navigation"><svg><use href="#i-close"></use></svg></button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-section-heading"><span>Workspace</span></div>
+        <div class="connection-card" id="connectionCard">
+          <span class="connection-light" id="connectionLight"></span>
+          <div><strong id="connectionAccount">Not connected</strong><span id="connectionMeta">Choose a profile to begin</span></div>
+        </div>
+        <div class="sidebar-section-heading repo-heading"><span>Repositories</span><span class="sidebar-count" id="repoCount">0</span></div>
+        <label class="sidebar-search">
+          <svg><use href="#i-search"></use></svg>
+          <span class="sr-only">Search repositories</span>
+          <input id="repoSearch" type="search" placeholder="Find a repository" autocomplete="off" disabled>
+        </label>
+        <nav class="repo-nav" id="repoList" aria-label="Repositories">
+          <p class="sidebar-hint">Connect to load repositories.</p>
+        </nav>
+        <button type="button" id="loadMoreRepos" class="sidebar-load-more" hidden>Load more repositories <svg><use href="#i-arrow"></use></svg></button>
+        <div class="sidebar-footer"><span class="footer-lock">●</span> Runs locally · AWS credentials stay on your Mac</div>
+      </aside>
+      <div class="sidebar-scrim mobile-only" id="sidebarScrim" hidden></div>
+
+      <main class="main-content" id="main">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button class="icon-button mobile-only" id="openSidebar" type="button" aria-label="Open navigation"><svg><use href="#i-menu"></use></svg></button>
+            <span class="topbar-eyebrow">Registry workspace</span>
+            <span class="topbar-slash">/</span>
+            <span id="topbarLocation">Overview</span>
+          </div>
+          <div class="topbar-right"><button class="topbar-lock" id="lockTabButton" type="button" hidden>Lock this tab</button><span class="local-badge"><span></span> Local session</span></div>
+        </header>
+
+        <div class="page-content">
+          <section class="page-heading">
+            <div>
+              <div class="eyebrow">CONTAINER SECURITY</div>
+              <h1 id="pageTitle">Your ECR registry, in focus</h1>
+              <p id="pageSubtitle">Connect an AWS profile to scan image layers or check a matching build-host SBOM with Trivy.</p>
+            </div>
+            <div class="heading-actions" id="headingActions" hidden>
+              <button class="button button-secondary" id="refreshButton" type="button"><svg><use href="#i-refresh"></use></svg> Refresh</button>
+              <button class="button button-quiet" id="changeConnectionButton" type="button">Switch AWS profile</button>
+            </div>
+          </section>
+
+          <section class="launch-gate" id="launchGate" aria-labelledby="launchGateTitle" hidden>
+            <div class="launch-gate-icon"><svg><use href="#i-shield"></use></svg></div>
+            <div><div class="card-eyebrow">PRIVATE LOCAL SESSION</div><h2 id="launchGateTitle" tabindex="-1">Open the launch URL from Terminal</h2><p>Return to the Terminal window running ECR Sentinel. Copy and open the complete private URL printed after <code>npm start</code>, including its <code>#token=</code> fragment. Keep that URL private; it grants access to this local app session.</p></div>
+          </section>
+
+          <section class="setup-card" id="setupCard" aria-labelledby="setupTitle">
+            <div class="setup-graphic"><div class="setup-graphic-inner"><svg><use href="#i-layers"></use></svg></div><span class="orbit orbit-one"></span><span class="orbit orbit-two"></span></div>
+            <div class="setup-body">
+              <div class="card-eyebrow"><span class="step-dot">01</span> CONNECT TO AWS</div>
+              <h2 id="setupTitle">Start with your configured profile</h2>
+              <p>Sentinel uses your local AWS CLI session to find private ECR images. Trivy can scan image layers when pull access is allowed, or check a matching SBOM bundle generated on an authorized build host.</p>
+              <form id="connectionForm" novalidate>
+                <div class="form-grid">
+                  <label class="field"><span>AWS profile</span><select id="profileSelect" required><option value="">Loading profiles…</option></select><small id="profileHelp">Profiles come from your AWS CLI configuration.</small></label>
+                  <label class="field"><span>AWS Region</span><input id="regionInput" list="regionOptions" value="us-east-1" autocomplete="off" required spellcheck="false"><small>Example: us-east-1</small></label>
+                  <datalist id="regionOptions"><option value="us-east-1"></option><option value="us-east-2"></option><option value="us-west-1"></option><option value="us-west-2"></option><option value="ca-central-1"></option><option value="eu-west-1"></option><option value="eu-central-1"></option><option value="ap-southeast-1"></option><option value="ap-southeast-2"></option></datalist>
+                </div>
+                <button class="auth-help-toggle" id="authHelpToggle" type="button" aria-expanded="false" aria-controls="authHelp"><svg><use href="#i-terminal"></use></svg> Need to enter MFA or sign in?</button>
+                <section class="auth-help" id="authHelp" aria-labelledby="authHelpTitle" hidden>
+                  <div class="auth-help-heading"><div class="auth-help-icon"><svg><use href="#i-terminal"></use></svg></div><div><h3 id="authHelpTitle">Authenticate your AWS profile</h3><p id="authHelpDescription">Choose a profile to see its sign-in step.</p></div></div>
+                  <div class="role-mfa-flow" id="roleMfaFlow" hidden>
+                    <label class="field" for="roleMfaCode"><span>One-time MFA code</span><input id="roleMfaCode" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" aria-describedby="roleMfaCodeHint roleMfaError" placeholder="6-digit code"><small id="roleMfaCodeHint">Use the code from the MFA device configured for this role.</small></label>
+                    <p class="form-error role-mfa-error" id="roleMfaError" role="alert" hidden></p>
+                    <button class="button button-primary" id="submitRoleMfaButton" type="button">Verify code and connect</button>
+                  </div>
+                  <details class="auth-terminal-details" id="authTerminalDetails" open><summary id="authTerminalSummary">Sign in using Terminal</summary>
+                    <div class="auth-command-row"><code id="authCommand"></code><button class="button button-secondary button-small" id="copyAuthCommand" type="button">Copy command</button></div>
+                    <p class="auth-next-step" id="authNextStep"></p>
+                    <div class="auth-help-actions"><button class="button button-secondary button-small" id="refreshProfilesButton" type="button">Refresh profiles</button><button class="button button-secondary button-small" id="retryConnectionButton" type="button">Retry connection</button></div>
+                  </details>
+                  <p class="auth-privacy" id="authPrivacy">Enter your MFA code only in the AWS CLI or your organization’s sign-in page. Sentinel does not receive it.</p>
+                </section>
+                <p class="form-error" id="connectionError" role="alert" hidden></p>
+                <div class="form-actions"><button class="button button-primary" id="connectButton" type="submit">Connect to registry <svg><use href="#i-arrow"></use></svg></button><span class="privacy-note"><svg><use href="#i-shield"></use></svg> MFA codes are not saved by Sentinel</span></div>
+              </form>
+            </div>
+          </section>
+
+          <section class="scanner-readiness" id="scannerReadiness" aria-labelledby="scannerStateTitle" aria-live="polite">
+            <div class="scanner-readiness-icon"><svg><use href="#i-scan"></use></svg></div>
+            <div class="scanner-readiness-copy"><strong id="scannerStateTitle">Checking local scanner…</strong><p id="scannerStateDescription">Looking for Trivy on this Mac.</p><div class="scanner-install" id="scannerInstall" hidden><code>brew install trivy</code><button class="button button-secondary button-small" id="copyInstallCommand" type="button">Copy install command</button><a href="https://trivy.dev/docs/latest/getting-started/installation/" target="_blank" rel="noopener noreferrer">Installation guide <svg><use href="#i-external"></use></svg></a></div></div>
+            <button class="button button-secondary button-small" id="checkScannerButton" type="button">Check again</button>
+          </section>
+
+          <section class="overview-guidance" id="overviewGuidance" aria-label="How it works">
+            <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-box"></use></svg></div><h3>Browse images</h3><p>Choose a repository, then inspect the exact digest behind each image tag.</p></div>
+            <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-scan"></use></svg></div><h3>Choose scan input</h3><p>Scan image layers with pull access, or import a matching build-host SBOM to check its recorded packages.</p></div>
+            <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-clock"></use></svg></div><h3>Review the evidence</h3><p>See affected packages, available fixes, scan time, platform, and scanner version.</p></div>
+          </section>
+
+          <section id="workspace" hidden>
+            <div class="summary-strip" id="summaryStrip">
+              <div class="summary-item"><span class="summary-label">AWS ACCOUNT</span><strong id="accountSummary">—</strong></div>
+              <div class="summary-item"><span class="summary-label">REGION</span><strong id="regionSummary">—</strong></div>
+              <div class="summary-item"><span class="summary-label">LOCAL SCANNER</span><strong id="scannerSummary">Checking…</strong></div>
+              <div class="summary-item"><span class="summary-label">REPOSITORIES LOADED</span><strong id="repoSummary">—</strong></div>
+            </div>
+
+            <section class="content-card" id="repoOverview" aria-labelledby="overviewTitle">
+              <div class="content-card-header"><div><div class="card-eyebrow">REGISTRY OVERVIEW</div><h2 id="overviewTitle">Select a repository</h2><p>Choose an image digest to scan its layers or check a matching SBOM bundle.</p></div><div class="overview-deco"><svg><use href="#i-layers"></use></svg></div></div>
+              <div class="repository-grid" id="repositoryGrid"></div>
+              <div class="empty-state" id="repositoriesEmpty" hidden><div class="empty-icon"><svg><use href="#i-box"></use></svg></div><h3>No repositories found</h3><p>This account and Region have no private ECR repositories you can view.</p></div>
+            </section>
+
+            <section class="content-card" id="imagesView" hidden aria-labelledby="imagesTitle">
+              <div class="content-card-header images-header"><div><div class="card-eyebrow">REPOSITORY</div><h2 id="imagesTitle"></h2><p id="imagesSubtitle"></p></div><span class="mode-pill" id="repoScanPill">Trivy · image or SBOM</span></div>
+              <div class="table-toolbar"><div class="toolbar-title"><strong>Images</strong><span id="imageCountLabel">0 loaded</span></div><div class="toolbar-controls"><label class="search-control"><svg><use href="#i-search"></use></svg><span class="sr-only">Search images by tag or digest</span><input id="imageSearch" type="search" placeholder="Search tag or digest" autocomplete="off"></label><label class="sort-control"><span class="sr-only">Sort images</span><select id="imageSort"><option value="newest">Newest pushed</option><option value="oldest">Oldest pushed</option><option value="tag">Tag A–Z</option></select></label></div></div>
+              <div class="table-wrap"><table class="data-table image-table"><thead><tr><th scope="col">Image</th><th scope="col">Digest</th><th scope="col">Pushed</th><th scope="col">Size</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead><tbody id="imageRows"></tbody></table></div>
+              <div class="empty-state" id="imagesEmpty" hidden><div class="empty-icon"><svg><use href="#i-box"></use></svg></div><h3 id="imagesEmptyTitle">No images yet</h3><p id="imagesEmptyText">This repository has no images.</p></div>
+              <div class="table-footer"><span id="imagesFooter">Showing loaded images</span><button class="button button-secondary" id="loadMoreImages" type="button" hidden>Load more images <svg><use href="#i-arrow"></use></svg></button></div>
+            </section>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+    <aside class="finding-drawer" id="findingDrawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" hidden>
+      <div class="drawer-topbar"><div class="drawer-heading"><div class="card-eyebrow">IMAGE REVIEW</div><h2 id="drawerTitle">Image findings</h2><p id="drawerProfile"></p></div><div class="drawer-topbar-actions"><button class="button button-secondary button-small" id="drawerChangeConnectionButton" type="button">Switch AWS profile</button><button class="icon-button" id="closeDrawer" type="button" aria-label="Close image findings"><svg><use href="#i-close"></use></svg></button></div></div>
+      <div class="drawer-content">
+        <div class="image-identity"><span class="identity-label">IMAGE DIGEST</span><code id="drawerDigest"></code><div class="drawer-tags" id="drawerTags"></div></div>
+        <div class="platform-row"><label class="field platform-field"><span>Image platform</span><select id="platformSelect"><option value="linux/amd64">linux/amd64</option><option value="linux/arm64">linux/arm64</option></select><small>Scan results apply to this platform only.</small></label></div>
+        <p class="form-error sbom-import-error" id="sbomImportError" role="alert" tabindex="-1" hidden></p>
+        <div class="scan-status-card" id="scanStatusCard" role="status" aria-live="polite"><div class="status-icon"><svg><use href="#i-info"></use></svg></div><div><strong id="scanStatusTitle">Checking local report</strong><p id="scanStatusDescription">Looking for a previous Trivy scan of this digest and platform.</p><span id="scanTimestamp"></span><button class="button button-secondary button-small scan-recovery-action" id="scanSwitchProfileButton" type="button" hidden>Switch AWS profile</button></div></div>
+        <dl class="scan-provenance" id="scanProvenance" hidden><div><dt>Scanner</dt><dd id="reportScanner">—</dd></div><div><dt>Database updated</dt><dd id="reportDbDate">—</dd></div><div><dt id="reportImageLabel">Image</dt><dd id="reportImage">—</dd></div><div><dt>Coverage</dt><dd id="reportCoverage">—</dd></div><div id="reportSbomProducerRow" hidden><dt>SBOM producer claim</dt><dd id="reportSbomProducer">—</dd></div><div id="reportSbomHashRow" hidden><dt>Normalized SBOM SHA-256</dt><dd id="reportSbomHash">—</dd></div></dl>
+        <p class="sbom-association-note" id="reportSbomAssociation" hidden>SBOM producer and image association are claims in the imported file. They have not been cryptographically verified.</p>
+        <p class="coverage-note" id="reportCoverageNote" hidden></p>
+        <p class="report-retention" id="reportRetention" hidden>Reports are held in limited memory while the app runs. Older reports may be evicted and all are cleared on server restart. Export the CSV to retain one.</p>
+        <div class="severity-grid" id="severityGrid"></div>
+        <div class="findings-section"><div class="findings-heading"><div><h3>Vulnerabilities</h3><p id="findingsCountLabel">Checking for a previous local report…</p></div><div class="finding-actions"><button class="button button-secondary button-small" id="exportButton" type="button" disabled><svg><use href="#i-download"></use></svg> Export report</button><button class="button button-secondary button-small" id="refreshFindingsButton" type="button"><svg><use href="#i-refresh"></use></svg> Refresh</button></div></div>
+          <p class="finding-count-note">Each finding is a vulnerability in an affected package. The same CVE can appear more than once.</p>
+          <div class="finding-filter-row"><label class="search-control"><svg><use href="#i-search"></use></svg><span class="sr-only">Search findings</span><input id="findingSearch" type="search" placeholder="Search advisory, package or target" autocomplete="off"></label><label class="sort-control"><svg><use href="#i-filter"></use></svg><span class="sr-only">Filter by severity</span><select id="severityFilter"><option value="ALL">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="UNKNOWN">Unknown</option></select></label></div>
+          <div class="finding-list" id="findingList"></div>
+          <div class="empty-state drawer-empty" id="findingsEmpty" hidden><div class="empty-icon"><svg><use href="#i-check"></use></svg></div><h3 id="findingsEmptyTitle">No local report yet</h3><p id="findingsEmptyText">Run Trivy to check this image for known vulnerabilities.</p></div>
+          <button class="button button-secondary load-more-findings" id="loadMoreFindings" type="button" hidden>Show 100 more findings <svg><use href="#i-arrow"></use></svg></button>
+        </div>
+      </div>
+      <div class="drawer-footer"><span id="drawerScanHint">Scan image layers with Trivy or import an SBOM bundle from an authorized build host.</span><small class="sbom-helper-hint">No bundle yet? Run <code>scripts/generate-sbom-bundle.mjs</code> on an authorized build host after push. See the README for usage.</small><div class="drawer-footer-actions"><button class="button button-secondary" id="cancelRunningScanButton" type="button" hidden>Cancel scan</button><button class="button button-secondary" id="importSbomButton" type="button" disabled>Import SBOM bundle</button><input id="sbomFileInput" class="sr-only" type="file" accept=".json,application/json" aria-label="Choose an SBOM bundle JSON file" tabindex="-1"><button class="button button-primary" id="startScanButton" type="button" disabled><svg><use href="#i-scan"></use></svg> Scan image with Trivy</button></div></div>
+    </aside>
+
+    <div class="modal-backdrop" id="confirmBackdrop" hidden></div>
+    <div class="confirm-modal" id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" hidden><div class="modal-icon"><svg><use href="#i-scan"></use></svg></div><h2 id="confirmTitle">Scan this image locally?</h2><p id="confirmText">Trivy will transfer image layers from ECR to this Mac for the selected platform. This requires ECR image-pull permissions; some files may be stored temporarily during analysis. Trivy may also download vulnerability database updates. ECR managed scanning is not started.</p><div class="modal-target" id="confirmTarget"></div><div class="modal-actions"><button class="button button-secondary" id="cancelScanButton" type="button">Cancel</button><button class="button button-primary" id="confirmScanButton" type="button">Start Trivy scan</button></div></div>
+    <div class="toast-stack" id="toastStack" role="status" aria-live="polite"></div>
+  </body>
+</html>

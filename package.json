@@ -1,0 +1,18 @@
+{
+  "name": "ecr-sentinel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Trivy vulnerability scanning for private Amazon ECR images",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/credential-providers": "^3.1154.0",
+    "@smithy/node-http-handler": "^4.12.1"
+  }
+}
