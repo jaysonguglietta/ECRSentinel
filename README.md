@@ -1,17 +1,27 @@
 # ECR Sentinel
 
-A local Mac application for finding known vulnerabilities in private Amazon ECR images. Sentinel uses your configured AWS CLI profile to list repositories and image digests. [Trivy](https://trivy.dev/docs/latest/advanced/private-registries/ecr/) can scan image layers directly when the profile permits pulls, scan a bundle generated on an authorized build host, or scan an Amazon Inspector CycloneDX SBOM exported for an Inspector-monitored image. The Inspector path needs no image-layer pull permission on this Mac. It uses Inspector's existing image analysis to obtain the package inventory, then runs Trivy's vulnerability matching locally.
+A local Mac application for finding known package vulnerabilities in private Amazon ECR images. Sentinel uses a named AWS CLI profile to list repositories and immutable image digests. It runs [Trivy](https://trivy.dev/docs/latest/advanced/private-registries/ecr/) against either image layers the profile may pull, an SBOM bundle produced from the final image on an authorized build host, or a CycloneDX SBOM exported by Amazon Inspector for an already monitored image. The two SBOM paths transfer package inventory to the Mac without pulling image layers there. Inspector supplies inventory; Trivy performs the local CVE match.
 
 ## Product brief
 
 - **User:** an engineer or security analyst reviewing private ECR images from one Mac.
-- **Problem:** operators need an independent, on-demand vulnerability report even when ECR managed scanning is disabled.
-- **Workflow:** select a profile and Region → authenticate → verify the account → browse repositories and image digests → choose a platform → configure an approved Inspector destination once, then start an Inspector SBOM export with one click; alternatively import a build-generated bundle or scan image layers where permitted → review Trivy CVEs and coverage → export findings.
+- **Problem:** operators need an on-demand Trivy report while working within different ECR image-access policies, including profiles that may list images but cannot pull layers.
+- **Workflow:** select a profile and Region → authenticate → verify the account → browse repositories and image digests → choose the deployed platform → choose an authorized scan input → review CVEs and coverage → optionally export CSV. The Inspector path has one-time destination setup, then one-click exports.
 - **Views:** connection and authentication guidance, repository overview, image inventory, scan methods and progress, findings and export.
 - **Data:** AWS profiles, repositories, image digests/tags, Inspector export jobs and S3 destinations, SBOM provenance, local scan jobs, package vulnerability findings. A tag is display context; the digest identifies the artifact.
 - **Edge cases:** expired MFA/SSO sessions, missing Inspector or S3/KMS permissions, unmonitored or archived images, mismatched digest/platform, missing image-pull permission, network or database outage, multi-platform indexes, malformed SBOMs, and interrupted scans.
-- **Assumptions:** one local operator, private ECR, AWS CLI v2 and a trusted named profile, and Trivy installed on the Mac. Inspector export requires Enhanced Scanning coverage plus an administrator-approved S3 bucket and KMS key in the image's Region. A strictly read-only AWS profile cannot request the export. Direct image scanning requires pull access; the build-host path requires an authorized host and private transfer.
+- **Assumptions:** one local operator, private ECR, AWS CLI v2 and a trusted named profile, and Trivy installed on the Mac. Inspector export requires existing Enhanced Scanning coverage plus an administrator-approved S3 bucket and KMS key in the image's Region. A strictly read-only AWS profile cannot request the export. Direct image scanning requires pull access; the build-host path requires an authorized host and private transfer.
 - **Done for this version:** live ECR inventory and three scan paths, one-time Inspector destination setup with one-click subsequent scans, bounded local jobs, responsive reports, loopback-only access, clear failure states, and passing checks. Live Inspector export and private image access still require verification with an authorized AWS account.
+
+## Choose the right scan path
+
+| Path | What must already exist | Mac profile needs beyond ECR inventory | What reaches the Mac |
+| --- | --- | --- | --- |
+| **Scan image with Trivy** | Image in ECR; Trivy installed | ECR registry token and image-layer pull actions | Image layers and scanner databases |
+| **Import build-host SBOM** | Matching bundle generated from the final image by an authorized host | No additional AWS action for the import | The private SBOM bundle and scanner databases |
+| **Inspector SBOM → Trivy** | Inspector Enhanced Scanning coverage; approved S3 bucket, prefix, and KMS key | `inspector2:CreateSbomExport` and `GetSbomExport`, prefix-scoped S3 list/read, KMS decrypt | The Inspector SBOM JSON and scanner databases |
+
+All paths use `ecr:DescribeRepositories` and `ecr:DescribeImages` for inventory and digest checks. `CreateSbomExport` is an AWS **Write** action and cannot be used by a strictly read-only role. Sentinel cannot create the bucket, key, policies, or IAM exception. A successful ECR inventory connection does not imply that a scan path is authorized. [AWS access](docs/AWS_ACCESS.md) and the [Inspector handoff](docs/INSPECTOR_SBOM.md#request-for-the-aws-administrator) cover the exact boundary.
 
 ## Run on your Mac
 
@@ -33,16 +43,18 @@ Open the **exact launch URL printed by `npm start`**, including its `#token=...`
 
 Restarting the server creates a new private launch URL; reopen that URL in any older browser tab. Once connected, use **Switch AWS profile** in the workspace or image review drawer to return to the profile selector. For **Inspector SBOM → Trivy**, enter the administrator-approved export bucket, prefix, and KMS key once in the app. Later scans of images in that profile, account, and Region use the saved destination with one click. If your role is strictly read-only, give the AWS team the [administrator handoff](docs/INSPECTOR_SBOM.md#request-for-the-aws-administrator) first; Sentinel cannot initiate an Inspector export until they grant `CreateSbomExport`.
 
-### Documentation
+### Documentation by task
 
-- [Operator guide](docs/USER_GUIDE.md): connect, authenticate, browse, scan, review, and export.
-- [AWS access](docs/AWS_ACCESS.md): profile setup, MFA support, least-privilege examples, and network requirements.
-- [Build-host SBOM workflow](docs/BUILD_HOST_SBOM.md): generate and transfer an image-bound bundle without granting this Mac image-pull access.
-- [Inspector SBOM workflow](docs/INSPECTOR_SBOM.md): export an SBOM for a monitored ECR image, then run Trivy locally without image-layer pull permission.
-- [Troubleshooting](docs/TROUBLESHOOTING.md): connection, permission, scanner, and SBOM recovery steps.
-- [Architecture and local API](docs/ARCHITECTURE.md): components, trust boundaries, routes, job lifecycle, and data retention.
-- [Development and verification](docs/DEVELOPMENT.md): source map, tests, change checklist, and release checks.
-- [Security policy](SECURITY.md) and [adversarial audit](SECURITY_AUDIT.md): reporting guidance and documented residual risks.
+| If you need to… | Start here |
+| --- | --- |
+| Connect for the first time, browse images, scan, filter, and export | [Operator guide](docs/USER_GUIDE.md) |
+| Set up role MFA, understand profile limitations, or request least-privilege IAM and network access | [AWS access guide](docs/AWS_ACCESS.md) |
+| Ask an AWS administrator to enable Inspector exports and operate the one-time destination setup | [Inspector SBOM guide](docs/INSPECTOR_SBOM.md) |
+| Generate a bundle after a manual or other-system build and import it without ECR pulls on the Mac | [Build-host SBOM guide](docs/BUILD_HOST_SBOM.md) |
+| Diagnose a failed connection, export, pull, database update, or mismatch | [Troubleshooting](docs/TROUBLESHOOTING.md) |
+| Review routes, trust boundaries, storage, and job lifecycle | [Architecture and local API](docs/ARCHITECTURE.md) |
+| Work on code or run release checks | [Development and verification](docs/DEVELOPMENT.md) |
+| Report a vulnerability or assess deployment risk | [Security policy](SECURITY.md) and [adversarial audit](SECURITY_AUDIT.md) |
 
 ### Profiles that require MFA
 
@@ -65,7 +77,7 @@ The app uses the AWS SDK credential provider to resolve role-profile MFA and use
 
 ### AWS permissions
 
-The selected role needs permissions to discover ECR repositories and image digests. **Direct image scans also need permission to pull image layers.** Imported build-host bundles need only ECR inventory permission on the Mac. The Inspector export path additionally needs `inspector2:CreateSbomExport`, `inspector2:GetSbomExport`, prefix-scoped S3 list/read, and KMS decrypt; the Inspector service needs write/encrypt access to the approved destination. AWS classifies `CreateSbomExport` as [Write](https://docs.aws.amazon.com/service-authorization/latest/reference/list_inspector2.html), so the user's strictly read-only role **cannot start this workflow** until an AWS administrator grants that narrow exception and prepares the bucket/key. Sentinel can remember the destination once and start future exports with one click, but cannot create AWS resources or override IAM permissions. None of the SBOM paths requires ECR layer-pull permission on this Mac. The illustrative policy below is for direct image scanning and uses separate registry and repository scopes. Replace `REGION` and `ACCOUNT_ID`; narrow the repository ARN if appropriate. `sts:GetCallerIdentity` does not need an explicit IAM allow. AWS Organizations SCPs, permission boundaries, and repository policies may impose further limits. See [AWS's ECR pull permissions](https://docs.aws.amazon.com/AmazonECR/latest/userguide/ECR_on_ECS.html), [service authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ecr.html), and the [Inspector setup guide](docs/INSPECTOR_SBOM.md).
+The selected role needs permissions to discover ECR repositories and image digests. **Direct image scans also need permission to pull image layers.** Imported build-host bundles need only ECR inventory permission on the Mac. The Inspector export path additionally needs `inspector2:CreateSbomExport`, `inspector2:GetSbomExport`, prefix-scoped S3 list/read, and KMS decrypt; the Inspector service needs write/encrypt access to the approved destination. AWS classifies `CreateSbomExport` as [Write](https://docs.aws.amazon.com/service-authorization/latest/reference/list_inspector2.html), so a strictly read-only role **cannot start this workflow** until an AWS administrator grants that exception and prepares the bucket/key. The action currently requires IAM `Resource: "*"`; S3/KMS policies confine the destination. Sentinel can remember the destination once and start future exports with one click, but cannot create AWS resources or override IAM permissions. Neither SBOM path requires ECR layer-pull permission on this Mac. The illustrative policy below is for direct image scanning and uses separate registry and repository scopes. Replace `REGION` and `ACCOUNT_ID`; narrow the repository ARN if appropriate. `sts:GetCallerIdentity` does not need an explicit IAM allow. AWS Organizations SCPs, permission boundaries, and repository policies may impose further limits. See [AWS's ECR pull permissions](https://docs.aws.amazon.com/AmazonECR/latest/userguide/ECR_on_ECS.html), [service authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ecr.html), and the [Inspector setup guide](docs/INSPECTOR_SBOM.md).
 
 A profile can successfully list repositories and images yet fail a Trivy scan if it lacks pull permissions. For example, `ecr:BatchGetImage` is required on the repository. If that happens, use **Switch AWS profile** or ask an AWS administrator to grant the narrow pull actions below.
 
@@ -74,18 +86,16 @@ A profile can successfully list repositories and images yet fail a Trivy scan if
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "RegistryDiscoveryAndLogin",
+      "Sid": "RegistryLogin",
       "Effect": "Allow",
-      "Action": [
-        "ecr:DescribeRepositories",
-        "ecr:GetAuthorizationToken"
-      ],
+      "Action": "ecr:GetAuthorizationToken",
       "Resource": "*"
     },
     {
-      "Sid": "InspectAndPullImages",
+      "Sid": "InspectAndPullApprovedImages",
       "Effect": "Allow",
       "Action": [
+        "ecr:DescribeRepositories",
         "ecr:DescribeImages",
         "ecr:BatchGetImage",
         "ecr:GetDownloadUrlForLayer"
@@ -100,12 +110,12 @@ For an imported build-host bundle, the Mac profile only needs ECR inventory acti
 
 ### Generate an SBOM bundle on the build host
 
-The included helper turns a **locally available final Docker image** into a CycloneDX bundle linked to an ECR repository digest and platform. Copy this project folder to the trusted build host, then run the helper **after pushing the exact image**. Docker's local `RepoDigests` for `--image` must include the ECR `repository@digest` supplied in the command. This check prevents labeling an unrelated local image as the selected ECR image. Record the immutable digest from your push result or [ECR `DescribeImages`](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_DescribeImages.html); do not rely on a mutable tag as the identity. For a multi-platform image, run the helper for each platform you intend to assess.
+The included helper turns a **locally available final Docker image** into a CycloneDX bundle linked to an ECR repository digest and platform. Copy this project folder to the trusted build host, run `npm ci` there, then run the helper **after pushing the exact image**. Docker's local `RepoDigests` for `--image` must include the ECR `repository@digest` supplied in the command. This check prevents labeling an unrelated local image as the selected ECR image. Record the immutable digest from your push result or [ECR `DescribeImages`](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_DescribeImages.html); do not rely on a mutable tag as the identity. For a multi-platform image, run the helper for each platform you intend to assess. The account ID and image name below are fictional examples.
 
 ```bash
 node scripts/generate-sbom-bundle.mjs \
-  --image 123456789012.dkr.ecr.us-east-1.amazonaws.com/team/service:build-42 \
-  --account 123456789012 \
+  --image 111122223333.dkr.ecr.us-east-1.amazonaws.com/team/service:build-42 \
+  --account 111122223333 \
   --region us-east-1 \
   --repository team/service \
   --digest sha256:REPLACE_WITH_THE_64_HEX_DIGIT_ECR_DIGEST \
@@ -121,7 +131,7 @@ On the Mac, select the **same** account, repository, digest, and platform in Sen
 
 Sentinel resolves the selected CLI profile, lists repositories and images through ECR, then asks Trivy to fetch the selected image by immutable digest. Trivy runs on your Mac, identifies operating system and supported language packages, checks them against its vulnerability database, and returns a JSON report. [Trivy's image scanner](https://trivy.dev/docs/latest/guide/scanner/vulnerability/) covers known package vulnerabilities; a scan with no findings cannot prove that an image has no vulnerabilities.
 
-**Direct local image scanning transfers image-layer bytes to this Mac.** [Trivy streams layers](https://www.trivy.dev/docs/latest/guide/references/troubleshooting/) rather than requiring a full `docker pull`, but can temporarily write files it needs to inspect. This still counts as image access and requires ECR pull permissions. Both SBOM paths transfer package inventory instead of image layers and run local Trivy against it. The build-host path imports a file generated from the final image; the Inspector path exports an SBOM for an already monitored ECR image to S3. Neither path can detect packages omitted from its SBOM, and neither provides the filesystem coverage of an image-layer scan. [ECR image metadata](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_DescribeImages.html) alone cannot reveal installed packages.
+**Direct local image scanning transfers image-layer bytes to this Mac.** Trivy may temporarily write analysis data even without a separate `docker pull`. This still counts as image access and requires ECR pull permissions. Both SBOM paths transfer package inventory instead of image layers and run local Trivy against it. The build-host path imports a file generated from the final image; the Inspector path exports an SBOM for an already monitored ECR image to S3. Neither path can detect packages omitted from its SBOM, and neither provides the filesystem coverage of an image-layer scan. [ECR image metadata](https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_DescribeImages.html) alone cannot reveal installed packages.
 
 Sentinel does not call ECR basic scan APIs or present Inspector's CVE findings as its own. The Inspector SBOM option relies on **existing Inspector Enhanced Scanning** coverage; AWS runs that analysis independently. Trivy then performs a local match against the exported SBOM. The other two paths do not require Inspector.
 
