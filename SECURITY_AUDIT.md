@@ -118,7 +118,7 @@ There is no SQL/NoSQL database, multipart or archive parser, template engine, LD
 - **Potential impact:** sensitive software inventory leaves the intended AWS storage boundary. This does not give the attacker image-layer bytes.
 - **Recommended fix and patch guidance:** for managed deployments, load permitted bucket names, Region-scoped KMS key ARNs, and prefixes from local administrator configuration rather than a per-request free-form destination. Reject any request outside those values before calling Inspector. Restrict the AWS role and Inspector service bucket/key policies to the approved destination and use a dedicated bucket. Keep the local launch URL secret.
 - **Validation:** with a disposable export-capable role, submit the allowed destination and an attacker-controlled bucket/key in the same Region; assert only the former reaches `CreateSbomExport`. Verify denial through IAM/bucket/key policy as well as the app allowlist.
-- **Category:** CWE-918 / CWE-200 in a conditional service-mediated export path; OWASP A01 Broken Access Control.
+- **Category:** CWE-284 improper access control and CWE-200 information exposure in a conditional service-mediated export path; OWASP A01 Broken Access Control.
 
 ### F-07 — S3 object replacement can make an Inspector SBOM appear metadata verified
 
