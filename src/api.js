@@ -88,6 +88,16 @@ export function createApi(aws, scans = new TrivyScanService(aws)) {
     if (request.method === 'GET' && pathname === '/api/scanner/status') {
       return sendJson(response, 200, await scans.status());
     }
+    if (request.method === 'GET' && pathname === '/api/inspector/destination') {
+      return sendJson(response, 200, await scans.inspectorDestination(params));
+    }
+    if (request.method === 'PUT' && pathname === '/api/inspector/destination') {
+      const body = await readJsonBody(request);
+      return sendJson(response, 200, await scans.saveInspectorDestination(body));
+    }
+    if (request.method === 'DELETE' && pathname === '/api/inspector/destination') {
+      return sendJson(response, 200, await scans.deleteInspectorDestination(params));
+    }
     if (request.method === 'GET' && pathname === '/api/scans/latest') {
       return sendJson(response, 200, await scans.latest(params));
     }
@@ -119,7 +129,8 @@ export function createApi(aws, scans = new TrivyScanService(aws)) {
       return sendJson(response, 200, scans.cancel(scanId));
     }
     if (['/api/profiles', '/api/auth-method', '/api/auth/mfa', '/api/identity', '/api/repositories', '/api/images',
-      '/api/scanner/status', '/api/scans/latest', '/api/scans', '/api/scans/sbom', '/api/scans/inspector'].includes(pathname) || scanId) {
+      '/api/scanner/status', '/api/inspector/destination', '/api/scans/latest', '/api/scans', '/api/scans/sbom',
+      '/api/scans/inspector'].includes(pathname) || scanId) {
       throw new AwsCliError(405, 'METHOD_NOT_ALLOWED', 'This API endpoint does not support that method.');
     }
     throw new AwsCliError(404, 'NOT_FOUND', 'This API endpoint does not exist.');

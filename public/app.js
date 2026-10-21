@@ -2,7 +2,6 @@ import { authenticationGuide } from './auth-guide.js';
 
 const $ = (id) => document.getElementById(id);
 const tokenStorageKey = 'ecr-sentinel-launch-token';
-const inspectorSettingsPrefix = 'ecr-sentinel-inspector-settings:';
 const tokenPattern = /^[0-9a-f]{64}$/i;
 
 function readLaunchToken() {
@@ -38,8 +37,11 @@ const state = {
   visibleFindings: 100,
   scanJob: null, scanPollTimer: null, scanPollFailures: 0, pollError: null, cancelRequestedId: null,
   pendingSbomBundle: null, readingSbomFile: false, inspectorSubmitting: false,
+  inspectorDestination: null, inspectorDestinationLoading: false, inspectorDestinationLoaded: false,
+  inspectorDestinationError: null, inspectorConfigEditing: false, inspectorConfigSubmitting: false,
+  inspectorDestinationRequestId: 0,
   requestId: 0, repositoryRequestId: 0, findingRequestId: 0, connectionId: 0, activeDialog: null,
-  drawerPriorFocus: null, modalPriorFocus: null,
+  drawerPriorFocus: null, modalPriorFocus: null, inspectorRemovePriorFocus: null,
   authMethod: 'standard', authRequestId: 0, roleMfaRequestId: 0,
 };
 
@@ -76,38 +78,6 @@ function isSbomMode(mode) {
 
 function isInspectorReport(report) {
   return report?.provenance?.source === 'amazon-inspector' && report?.provenance?.association === 'metadata-verified';
-}
-
-function inspectorSettingsKey() {
-  const account = state.identity?.account;
-  return account && state.profile && state.region
-    ? `${inspectorSettingsPrefix}${account}:${state.region}:${state.profile}` : null;
-}
-
-function loadInspectorSettings() {
-  const key = inspectorSettingsKey();
-  let values = null;
-  try { values = key ? JSON.parse(sessionStorage.getItem(key) || 'null') : null; }
-  catch { /* Ignore invalid tab-local settings. */ }
-  $('inspectorBucket').value = typeof values?.bucketName === 'string' ? values.bucketName.slice(0, 63) : '';
-  $('inspectorKmsArn').value = typeof values?.kmsKeyArn === 'string' ? values.kmsKeyArn.slice(0, 256) : '';
-  $('inspectorPrefix').value = typeof values?.keyPrefix === 'string' ? values.keyPrefix.slice(0, 400) : '';
-}
-
-function saveInspectorSettings(values, key = inspectorSettingsKey()) {
-  if (!key) return;
-  try { sessionStorage.setItem(key, JSON.stringify(values)); }
-  catch { /* The workflow still works if tab storage is unavailable. */ }
-}
-
-function clearInspectorSettings() {
-  try {
-    for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
-      const key = sessionStorage.key(index);
-      if (key?.startsWith(inspectorSettingsPrefix)) sessionStorage.removeItem(key);
-    }
-  } catch { /* In-memory inputs are cleared below. */ }
-  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).value = '';
 }
 
 function icon(name) {
@@ -250,10 +220,19 @@ function showLaunchGate() {
   state.findingRequestId += 1;
   state.activeDialog = null;
   state.pendingSbomBundle = null;
+  state.inspectorDestinationRequestId += 1;
+  state.inspectorDestination = null;
+  state.inspectorDestinationLoaded = false;
+  state.inspectorDestinationLoading = false;
+  state.inspectorDestinationError = null;
+  state.inspectorConfigEditing = false;
+  state.inspectorConfigSubmitting = false;
   clearTimeout(state.scanPollTimer);
   state.scanPollTimer = null;
   $('confirmModal').hidden = true;
   $('confirmBackdrop').hidden = true;
+  $('removeInspectorModal').hidden = true;
+  $('removeInspectorBackdrop').hidden = true;
   $('findingDrawer').hidden = true;
   $('drawerBackdrop').hidden = true;
   document.body.style.overflow = '';
@@ -765,7 +744,7 @@ function openImage(image) {
   state.pendingSbomBundle = null;
   $('sbomImportError').hidden = true;
   resetInspectorError();
-  loadInspectorSettings();
+  resetInspectorSetupError();
   state.drawerPriorFocus = document.activeElement;
   $('drawerTitle').textContent = image.tags?.[0] || 'Untagged image';
   $('drawerProfile').textContent = `AWS profile: ${state.profile} · ${state.region}`;
@@ -786,10 +765,13 @@ function openImage(image) {
   $('findingsEmpty').hidden = false;
   $('findingsCountLabel').textContent = 'Checking for a previous local report…';
   $('exportButton').disabled = true;
+  loadInspectorDestination();
   loadLatestReport();
 }
 
 function closeDrawer() {
+  if (!$('removeInspectorModal').hidden) closeRemoveInspectorConfirmation();
+  state.inspectorDestinationRequestId += 1;
   clearTimeout(state.scanPollTimer);
   state.scanPollTimer = null;
   state.findingRequestId += 1;
@@ -808,20 +790,103 @@ function currentScanKey() {
 function resetInspectorError() {
   $('inspectorError').hidden = true;
   $('inspectorError').textContent = '';
-  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).removeAttribute('aria-invalid');
 }
 
-function showInspectorError(message, fieldId = null) {
+function showInspectorError(message) {
   resetInspectorError();
   $('inspectorError').textContent = message;
   $('inspectorError').hidden = false;
+  $('inspectorError').focus();
+}
+
+function resetInspectorSetupError() {
+  $('inspectorSetupError').hidden = true;
+  $('inspectorSetupError').textContent = '';
+  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).removeAttribute('aria-invalid');
+}
+
+function showInspectorSetupError(message, fieldId = null) {
+  resetInspectorSetupError();
+  $('inspectorSetupError').textContent = message;
+  $('inspectorSetupError').hidden = false;
   if (fieldId) {
     $(fieldId).setAttribute('aria-invalid', 'true');
     $(fieldId).focus();
-  } else $('inspectorError').focus();
+  } else $('inspectorSetupError').focus();
 }
 
-function inspectorExportValues() {
+function inspectorDestinationUrl() {
+  return `/api/inspector/destination?${params({ profile: state.profile, region: state.region })}`;
+}
+
+function inspectorAdminRequest() {
+  return `Please set up Amazon Inspector SBOM export for AWS account ${state.identity?.account || 'our account'} in ${state.region || 'our Region'} and share the approved S3 bucket, key prefix, and customer-managed KMS key ARN. Configure the bucket and key policies so Amazon Inspector can write encrypted exports. Grant my AWS profile (${state.profile || 'the selected role'}) inspector2:CreateSbomExport and inspector2:GetSbomExport, s3:ListBucket and s3:GetObject scoped to that export prefix, and kms:Decrypt for the key. The ECR image must be monitored by Inspector Enhanced Scanning. If this profile is read-only, it cannot initiate an Inspector export without the additional grant.`;
+}
+
+function renderInspectorDestination() {
+  const destination = state.inspectorDestination;
+  const status = $('inspectorDestinationStatus');
+  const statusText = $('inspectorDestinationStatusText');
+  const retryButton = $('retryInspectorDestination');
+  status.hidden = Boolean(destination) && !state.inspectorDestinationLoading && !state.inspectorDestinationError;
+  status.classList.toggle('status-error', Boolean(state.inspectorDestinationError));
+  statusText.textContent = state.inspectorDestinationLoading ? 'Checking saved export destination for this AWS profile…'
+    : state.inspectorDestinationError ? `Could not load the saved destination: ${state.inspectorDestinationError}`
+      : state.inspectorDestinationLoaded ? 'No export destination saved for this profile, account, and Region.'
+        : 'Checking export destination for this AWS profile…';
+  retryButton.hidden = !state.inspectorDestinationError;
+  $('inspectorConfiguredView').hidden = !state.inspectorDestinationLoaded || !destination || state.inspectorConfigEditing;
+  $('inspectorSetupView').hidden = !state.inspectorDestinationLoaded || Boolean(destination && !state.inspectorConfigEditing);
+  if (destination) {
+    $('inspectorConfiguredBucket').textContent = destination.bucketName;
+    $('inspectorConfiguredPrefix').textContent = `Prefix: ${destination.keyPrefix || '(bucket root)'}`;
+    $('inspectorConfiguredKms').textContent = `KMS: ${destination.kmsKeyArn}`;
+  }
+  $('inspectorSetupTitle').textContent = destination ? 'Change export destination' : 'One-time export setup';
+  $('cancelInspectorDestinationEdit').hidden = !destination;
+  $('inspectorAdminRequest').textContent = inspectorAdminRequest();
+  const active = ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status);
+  const busy = active || state.inspectorSubmitting || state.inspectorConfigSubmitting || Boolean(state.activeDialog);
+  $('changeInspectorDestination').disabled = busy;
+  $('removeInspectorDestination').disabled = busy;
+  $('saveInspectorDestination').disabled = busy || state.inspectorDestinationLoading;
+  $('saveInspectorDestination').textContent = state.inspectorConfigSubmitting ? 'Saving…' : 'Save destination';
+  $('cancelInspectorDestinationEdit').disabled = busy;
+  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).disabled = busy;
+}
+
+async function loadInspectorDestination() {
+  if (!state.identity || !state.profile || !state.region) return;
+  const requestId = ++state.inspectorDestinationRequestId;
+  const connectionId = state.connectionId;
+  state.inspectorDestination = null;
+  state.inspectorDestinationLoaded = false;
+  state.inspectorDestinationLoading = true;
+  state.inspectorDestinationError = null;
+  state.inspectorConfigEditing = false;
+  renderInspectorDestination();
+  renderScanStatus();
+  try {
+    const result = await api(inspectorDestinationUrl(), { timeoutMs: 90000 });
+    if (requestId !== state.inspectorDestinationRequestId || connectionId !== state.connectionId) return;
+    state.inspectorDestination = result.configured ? result.destination : null;
+    state.inspectorDestinationLoaded = true;
+    $('inspectorBucket').value = state.inspectorDestination?.bucketName || '';
+    $('inspectorKmsArn').value = state.inspectorDestination?.kmsKeyArn || '';
+    $('inspectorPrefix').value = state.inspectorDestination?.keyPrefix || '';
+  } catch (error) {
+    if (requestId !== state.inspectorDestinationRequestId || connectionId !== state.connectionId || error.code === 'INVALID_API_TOKEN') return;
+    state.inspectorDestinationError = error.message || 'Check your AWS sign-in and try again.';
+  } finally {
+    if (requestId === state.inspectorDestinationRequestId && connectionId === state.connectionId) {
+      state.inspectorDestinationLoading = false;
+      renderInspectorDestination();
+      renderScanStatus();
+    }
+  }
+}
+
+function inspectorDestinationValues() {
   const bucketName = $('inspectorBucket').value.trim();
   const kmsKeyArn = $('inspectorKmsArn').value.trim();
   const keyPrefix = $('inspectorPrefix').value.trim();
@@ -841,17 +906,98 @@ function inspectorExportValues() {
   return { bucketName, kmsKeyArn, keyPrefix };
 }
 
-async function startInspectorExport(event) {
+async function saveInspectorDestination(event) {
   event.preventDefault();
-  if (state.inspectorSubmitting || !state.scanner.available || !state.image || !state.repository ||
-    state.image.status === 'ARCHIVED' || state.reportLoading || state.readingSbomFile || state.activeDialog ||
+  if (!state.inspectorDestinationLoaded || state.inspectorConfigSubmitting || state.inspectorSubmitting ||
     ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status)) return;
   let values;
-  try { values = inspectorExportValues(); }
-  catch (error) { showInspectorError(error.message, error.fieldId); return; }
+  try { values = inspectorDestinationValues(); }
+  catch (error) { showInspectorSetupError(error.message, error.fieldId); return; }
+  resetInspectorSetupError();
+  const connectionId = state.connectionId;
+  let saved = false;
+  state.inspectorConfigSubmitting = true;
+  renderInspectorDestination();
+  try {
+    const result = await api(inspectorDestinationUrl(), {
+      method: 'PUT', body: JSON.stringify({ profile: state.profile, region: state.region, destination: values }), timeoutMs: 90000,
+    });
+    if (connectionId !== state.connectionId || !apiToken) return;
+    state.inspectorDestination = result.destination;
+    state.inspectorConfigEditing = false;
+    state.inspectorDestinationError = null;
+    saved = true;
+    toast('Inspector export destination saved for this AWS profile.');
+  } catch (error) {
+    if (connectionId === state.connectionId && error.code !== 'INVALID_API_TOKEN') {
+      showInspectorSetupError(error.message || 'Could not save this destination. Check the values and AWS sign-in.');
+    }
+  } finally {
+    state.inspectorConfigSubmitting = false;
+    if (!$('findingDrawer').hidden) {
+      renderInspectorDestination();
+      renderScanStatus();
+      if (saved) $('startInspectorButton').focus();
+    }
+  }
+}
+
+function openRemoveInspectorConfirmation() {
+  if (!state.inspectorDestination || state.inspectorConfigSubmitting || state.inspectorSubmitting ||
+    ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status)) return;
+  state.inspectorRemovePriorFocus = document.activeElement;
+  state.activeDialog = 'remove-inspector';
+  $('removeInspectorModal').hidden = false;
+  $('removeInspectorBackdrop').hidden = false;
+  $('cancelRemoveInspector').focus();
+  renderScanStatus();
+}
+
+function closeRemoveInspectorConfirmation() {
+  if ($('removeInspectorModal').hidden) return;
+  $('removeInspectorModal').hidden = true;
+  $('removeInspectorBackdrop').hidden = true;
+  state.activeDialog = null;
+  if (state.inspectorRemovePriorFocus?.isConnected) state.inspectorRemovePriorFocus.focus();
+  renderScanStatus();
+}
+
+async function removeInspectorDestination() {
+  if ($('removeInspectorModal').hidden || !state.inspectorDestination) return;
+  closeRemoveInspectorConfirmation();
+  const connectionId = state.connectionId;
+  let removed = false;
+  state.inspectorConfigSubmitting = true;
+  renderScanStatus();
+  try {
+    await api(inspectorDestinationUrl(), { method: 'DELETE', timeoutMs: 90000 });
+    if (connectionId !== state.connectionId || !apiToken) return;
+    state.inspectorDestination = null;
+    state.inspectorConfigEditing = false;
+    removed = true;
+    for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).value = '';
+    toast('Saved Inspector export destination removed.');
+  } catch (error) {
+    if (connectionId === state.connectionId && error.code !== 'INVALID_API_TOKEN') {
+      showInspectorError(error.message || 'Could not remove the saved destination. Try again.');
+    }
+  } finally {
+    state.inspectorConfigSubmitting = false;
+    if (!$('findingDrawer').hidden) {
+      renderInspectorDestination();
+      renderScanStatus();
+      if (removed) $('inspectorBucket').focus();
+    }
+  }
+}
+
+async function startInspectorExport(event) {
+  event.preventDefault();
+  if (state.inspectorSubmitting || state.inspectorConfigSubmitting || state.inspectorConfigEditing || !state.inspectorDestination || !state.scanner.available || !state.image || !state.repository ||
+    state.image.status === 'ARCHIVED' || state.reportLoading || state.readingSbomFile || state.activeDialog ||
+    ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status)) return;
   resetInspectorError();
   const key = currentScanKey();
-  const settingsKey = inspectorSettingsKey();
   const connectionId = state.connectionId;
   state.inspectorSubmitting = true;
   renderScanStatus();
@@ -860,11 +1006,10 @@ async function startInspectorExport(event) {
       method: 'POST',
       body: JSON.stringify({
         profile: state.profile, region: state.region, repository: state.repository.name,
-        digest: state.image.digest, platform: $('platformSelect').value, ...values,
+        digest: state.image.digest, platform: $('platformSelect').value,
       }),
       timeoutMs: 90000,
     });
-    if (apiToken && connectionId === state.connectionId) saveInspectorSettings(values, settingsKey);
     if (connectionId === state.connectionId && key === currentScanKey() && !$('findingDrawer').hidden) {
       state.findingRequestId += 1;
       state.reportLoading = false;
@@ -879,6 +1024,11 @@ async function startInspectorExport(event) {
     if (apiToken && connectionId === state.connectionId) toast('Inspector SBOM workflow started. Trivy will check the listed packages when the export is ready.');
   } catch (error) {
     if (error.code !== 'INVALID_API_TOKEN' && connectionId === state.connectionId && key === currentScanKey() && !$('findingDrawer').hidden) {
+      if (error.code === 'INSPECTOR_DESTINATION_NOT_CONFIGURED') {
+        state.inspectorDestination = null;
+        state.inspectorDestinationLoaded = true;
+        renderInspectorDestination();
+      }
       showInspectorError(error.message || 'Could not start the Inspector export. Check the image and S3/KMS permissions, then try again.');
     }
   } finally {
@@ -1027,16 +1177,20 @@ function renderScanStatus() {
   $('importSbomButton').disabled = !state.scanner.available || !state.image || !state.repository || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
   $('platformSelect').disabled = state.inspectorSubmitting;
   $('refreshFindingsButton').disabled = state.inspectorSubmitting;
-  $('drawerChangeConnectionButton').disabled = state.inspectorSubmitting;
+  $('drawerChangeConnectionButton').disabled = state.inspectorSubmitting || state.inspectorConfigSubmitting;
   const inspectorButton = $('startInspectorButton');
-  inspectorButton.replaceChildren(icon('scan'), document.createTextNode(state.inspectorSubmitting ? 'Requesting export…' : 'Export SBOM and check CVEs'));
-  inspectorButton.disabled = !state.scanner.available || !state.image || !state.repository || state.image.status === 'ARCHIVED' || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
+  inspectorButton.replaceChildren(icon('scan'), document.createTextNode(state.inspectorSubmitting ? 'Requesting export…' : 'Start Inspector SBOM scan'));
+  inspectorButton.disabled = !state.inspectorDestination || !state.inspectorDestinationLoaded || state.inspectorConfigEditing || state.inspectorConfigSubmitting || !state.scanner.available || !state.image || !state.repository || state.image.status === 'ARCHIVED' || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
   $('inspectorActionHint').textContent = state.inspectorSubmitting ? 'Sending the request to Amazon Inspector…'
     : active ? 'Finish or cancel the current check before starting another.'
       : state.reportLoading ? 'Checking for an existing local job…'
+        : state.inspectorDestinationError ? 'Could not check the saved destination. Try again above.'
+          : !state.inspectorDestinationLoaded ? 'Checking export setup for this AWS profile…'
+            : state.inspectorConfigEditing ? 'Save or cancel destination changes before starting a scan.'
+              : !state.inspectorDestination ? 'Set up an approved export destination first.'
         : !state.scanner.available ? 'Install Trivy and check again to enable this workflow.'
           : state.image?.status === 'ARCHIVED' ? 'Archived images are unavailable for Inspector export.'
-            : 'Only the SBOM is downloaded to this Mac.';
+            : 'Only the SBOM is downloaded. AWS export permissions are checked when the scan starts.';
   $('cancelRunningScanButton').hidden = !active;
   $('cancelRunningScanButton').textContent = inspectorJob ? 'Stop local workflow' : 'Cancel scan';
   $('cancelRunningScanButton').disabled = !job?.id || state.cancelRequestedId === job.id;
@@ -1046,6 +1200,7 @@ function renderScanStatus() {
       : !state.scanner.available ? (state.scanner.checkFailed
         ? 'Check the local scanner again to enable the scan paths.' : 'Install Trivy and check again to enable the scan paths.')
         : 'The Inspector and imported SBOM paths check packages without downloading image layers.';
+  renderInspectorDestination();
 }
 
 function renderSeverity() {
@@ -1517,7 +1672,8 @@ function closeSidebar() {
 
 function trapDialogFocus(event) {
   if (event.key !== 'Tab') return;
-  const root = !$('confirmModal').hidden ? $('confirmModal') : !$('findingDrawer').hidden ? $('findingDrawer') : null;
+  const root = !$('removeInspectorModal').hidden ? $('removeInspectorModal')
+    : !$('confirmModal').hidden ? $('confirmModal') : !$('findingDrawer').hidden ? $('findingDrawer') : null;
   if (!root) return;
   const controls = [...root.querySelectorAll('button:not([disabled]):not([hidden]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]), a[href]')]
     .filter((item) => item.offsetParent !== null);
@@ -1537,6 +1693,10 @@ function changeConnection() {
   state.findingRequestId += 1;
   sessionStorage.removeItem('ecr-sentinel-connection');
   state.identity = null;
+  state.inspectorDestination = null;
+  state.inspectorDestinationLoaded = false;
+  state.inspectorConfigEditing = false;
+  state.inspectorConfigSubmitting = false;
   state.repository = null;
   state.repositories = [];
   state.images = [];
@@ -1548,7 +1708,6 @@ function changeConnection() {
 function init() {
   $('lockTabButton').addEventListener('click', () => {
     apiToken = '';
-    clearInspectorSettings();
     try {
       sessionStorage.removeItem(tokenStorageKey);
       sessionStorage.removeItem('ecr-sentinel-connection');
@@ -1643,8 +1802,39 @@ function init() {
   });
   $('sbomFileInput').addEventListener('change', selectSbomBundle);
   $('inspectorExportForm').addEventListener('submit', startInspectorExport);
+  $('inspectorDestinationForm').addEventListener('submit', saveInspectorDestination);
+  $('retryInspectorDestination').addEventListener('click', loadInspectorDestination);
+  $('changeInspectorDestination').addEventListener('click', () => {
+    if (!state.inspectorDestination || state.inspectorConfigSubmitting) return;
+    state.inspectorConfigEditing = true;
+    $('inspectorBucket').value = state.inspectorDestination.bucketName;
+    $('inspectorKmsArn').value = state.inspectorDestination.kmsKeyArn;
+    $('inspectorPrefix').value = state.inspectorDestination.keyPrefix || '';
+    resetInspectorSetupError();
+    renderScanStatus();
+    $('inspectorBucket').focus();
+  });
+  $('cancelInspectorDestinationEdit').addEventListener('click', () => {
+    state.inspectorConfigEditing = false;
+    resetInspectorSetupError();
+    renderScanStatus();
+    $('changeInspectorDestination').focus();
+  });
+  $('removeInspectorDestination').addEventListener('click', openRemoveInspectorConfirmation);
+  $('removeInspectorBackdrop').addEventListener('click', closeRemoveInspectorConfirmation);
+  $('cancelRemoveInspector').addEventListener('click', closeRemoveInspectorConfirmation);
+  $('confirmRemoveInspector').addEventListener('click', removeInspectorDestination);
+  $('copyInspectorAdminRequest').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(inspectorAdminRequest());
+      toast('AWS administrator request copied.');
+    } catch {
+      $('inspectorAdminDetails').open = true;
+      toast('Could not copy the request. Select the text above and copy it manually.', true);
+    }
+  });
   for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) {
-    $(id).addEventListener('input', resetInspectorError);
+    $(id).addEventListener('input', resetInspectorSetupError);
   }
   $('startScanButton').addEventListener('click', openScanConfirmation);
   $('cancelRunningScanButton').addEventListener('click', openCancelConfirmation);
@@ -1656,7 +1846,8 @@ function init() {
   $('sidebarScrim').addEventListener('click', closeSidebar);
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
-      if (!$('confirmModal').hidden) closeScanConfirmation();
+      if (!$('removeInspectorModal').hidden) closeRemoveInspectorConfirmation();
+      else if (!$('confirmModal').hidden) closeScanConfirmation();
       else if (!$('findingDrawer').hidden) closeDrawer();
       else closeSidebar();
     }

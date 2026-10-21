@@ -4,7 +4,8 @@ import { lstat, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AwsCliError, validateDigest, validateInspectorDestination, validateRegion, validateRepository } from './aws-cli.js';
+import { AwsCliError, validateDigest, validateRegion, validateRepository } from './aws-cli.js';
+import { InspectorDestinationStore } from './inspector-settings.js';
 
 const PLATFORM_RE = /^[a-z0-9]+\/[a-z0-9]+(?:\/[a-z0-9._-]+)?$/;
 const ACCOUNT_RE = /^\d{12}$/;
@@ -472,11 +473,13 @@ function verifyRepositoryUri(item, identity, repository, region) {
 }
 
 export class TrivyScanService {
-  constructor(aws, { run = runBounded, command = 'trivy', cacheRoot = join(tmpdir(), 'ecr-sentinel-trivy-cache') } = {}) {
+  constructor(aws, { run = runBounded, command = 'trivy', cacheRoot = join(tmpdir(), 'ecr-sentinel-trivy-cache'),
+    settingsRoot, settingsStore } = {}) {
     this.aws = aws;
     this.run = run;
     this.command = command;
     this.cacheRoot = cacheRoot;
+    this.settings = settingsStore ?? new InspectorDestinationStore(settingsRoot ? { root: settingsRoot } : {});
     this.cachePending = null;
     this.dbPreparedAt = null;
     this.scannerVersion = null;
@@ -565,9 +568,9 @@ export class TrivyScanService {
     }
   }
 
-  validateTarget(input) {
+  validateContext(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
-      throw new AwsCliError(400, 'INVALID_INPUT', 'Choose an image to scan.');
+      throw new AwsCliError(400, 'INVALID_INPUT', 'Select an AWS profile and Region.');
     }
     if (typeof input.profile !== 'string' || !input.profile || input.profile.length > 128 || /[\x00-\x1f\x7f]/.test(input.profile)) {
       throw new AwsCliError(400, 'INVALID_INPUT', 'Select a configured AWS profile.');
@@ -575,10 +578,43 @@ export class TrivyScanService {
     return {
       profile: input.profile,
       region: validateRegion(input.region),
+    };
+  }
+
+  validateTarget(input) {
+    return {
+      ...this.validateContext(input),
       repository: validateRepository(input.repository),
       digest: validateDigest(input.digest),
       platform: validatePlatform(input.platform),
     };
+  }
+
+  async verifiedInspectorContext(input) {
+    const selected = this.validateContext(input);
+    const identity = await this.aws.identity(selected.profile, selected.region);
+    if (!ACCOUNT_RE.test(identity?.account ?? '')) {
+      throw new AwsCliError(502, 'AWS_BAD_RESPONSE', 'AWS did not return a valid account identity.');
+    }
+    return { ...selected, account: identity.account };
+  }
+
+  async inspectorDestination(input) {
+    const context = await this.verifiedInspectorContext(input);
+    const destination = await this.settings.get(context);
+    return { configured: Boolean(destination), destination };
+  }
+
+  async saveInspectorDestination(input) {
+    const context = await this.verifiedInspectorContext(input);
+    const destination = await this.settings.put(context, input.destination);
+    return { configured: true, destination };
+  }
+
+  async deleteInspectorDestination(input) {
+    const context = await this.verifiedInspectorContext(input);
+    await this.settings.delete(context);
+    return { configured: false, destination: null };
   }
 
   async start(input) {
@@ -596,16 +632,23 @@ export class TrivyScanService {
 
   async startInspector(input) {
     const target = this.validateTarget(input);
+    if (['bucketName', 'keyPrefix', 'kmsKeyArn', 's3Destination', 'destination']
+      .some((key) => Object.hasOwn(input, key))) {
+      throw new AwsCliError(400, 'INVALID_INPUT', 'Save the Inspector export destination in the app, then start the scan.');
+    }
     if (target.platform.split('/').length !== 2 || !target.platform.startsWith('linux/')) {
       throw new AwsCliError(422, 'INSPECTOR_SBOM_PLATFORM_UNVERIFIED',
         'Inspector identifies image architecture but not OS or variant. Select a linux platform without a variant.');
     }
-    const checkedDestination = validateInspectorDestination(input, target.region);
-    if (checkedDestination.keyPrefix.length > 400) {
-      throw new AwsCliError(400, 'INVALID_INPUT', 'The S3 key prefix must be 400 characters or fewer.');
-    }
-    const destination = { ...checkedDestination, keyPrefix: checkedDestination.keyPrefix.replace(/\/+$/, '') };
     const identity = await this.aws.identity(target.profile, target.region);
+    if (!ACCOUNT_RE.test(identity?.account ?? '')) {
+      throw new AwsCliError(502, 'AWS_BAD_RESPONSE', 'AWS did not return a valid account identity.');
+    }
+    const destination = await this.settings.get({ profile: target.profile, region: target.region, account: identity.account });
+    if (!destination) {
+      throw new AwsCliError(409, 'INSPECTOR_DESTINATION_NOT_CONFIGURED',
+        'Set up the Inspector export destination for this AWS account and Region, then start the scan.');
+    }
     return this.enqueue(target, identity.account, 'inspector-sbom', null, destination);
   }
 

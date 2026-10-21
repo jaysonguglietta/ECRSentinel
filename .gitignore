@@ -11,6 +11,7 @@ npm-debug.log*
 .env.*
 !.env.example
 .aws/
+inspector-destinations.json
 *.pem
 *.p12
 *.pfx

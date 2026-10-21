@@ -69,6 +69,9 @@ See [the build-host workflow](BUILD_HOST_SBOM.md) for exact generation order and
 
 | Symptom | Recovery |
 | --- | --- |
+| `INSPECTOR_DESTINATION_NOT_CONFIGURED` or the scan shows setup instead of starting | Save an AWS administrator-approved bucket name, prefix, and KMS key ARN for the connected profile, account, and Region in Sentinel. A setting from another account or Region is not reused. |
+| Destination cannot be saved or read (`INSPECTOR_SETTINGS_UNSAFE` or `INSPECTOR_SETTINGS_INVALID`) | The private local settings path is unsafe, inaccessible, or malformed. Check ownership and permissions of Sentinel's Application Support directory; do not replace it with a symlink or a shared directory. If the file is corrupted, back it up privately and remove it while Sentinel is stopped, then re-enter the approved destination. |
+| The profile is strictly read-only | An administrator must grant `inspector2:CreateSbomExport`, which AWS classifies as Write. Saving a destination cannot grant permission. If policy forbids that exception, use a matching SBOM supplied by an authorized system. |
 | Inspector reports that the resource is unavailable or export fails | Confirm Enhanced Scanning covers the **exact digest** in the selected account and Region. Archived, removed, or unmonitored images cannot provide an Inspector SBOM. |
 | `AccessDenied` when creating or checking the export | Check `inspector2:CreateSbomExport` and `inspector2:GetSbomExport` for the selected profile, plus SCPs and permission boundaries. Verify the approved bucket/KMS service policies. |
 | Export succeeds but S3 retrieval is denied | Check prefix-scoped `s3:ListBucket`, `s3:GetObject`, `kms:Decrypt`, bucket policy, key policy, and S3 endpoint connectivity for the selected profile. |

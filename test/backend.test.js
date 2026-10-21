@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter, once } from 'node:events';
@@ -331,7 +331,8 @@ async function scanFixture(run) {
     exportCredentials: async () => ({ accessKeyId: validCredentials.AccessKeyId, secretAccessKey: validCredentials.SecretAccessKey, sessionToken: validCredentials.SessionToken }),
     identityForCredentials: async () => account,
   };
-  return { directory, aws, scans: new TrivyScanService(aws, { run, cacheRoot }) };
+  return { directory, aws, scans: new TrivyScanService(aws, { run, cacheRoot,
+    settingsRoot: join(directory, 'settings') }) };
 }
 
 test('scan updates DB without credentials, scans exact digest with role credentials, and remembers report', async () => {
@@ -569,8 +570,10 @@ test('Inspector export flows into credential-free Trivy SBOM scan and deletes lo
     await writeFile(path, document);
   };
   try {
-    const started = await fixture.scans.startInspector({ ...target, bucketName: 'security-sboms', keyPrefix: 'team/',
-      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` });
+    await fixture.scans.saveInspectorDestination({ profile: target.profile, region: target.region,
+      destination: { bucketName: 'security-sboms', keyPrefix: 'team/',
+        kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` } });
+    const started = await fixture.scans.startInspector(target);
     const completed = await waitForTerminal(fixture.scans, started.id);
     assert.equal(completed.status, 'COMPLETE');
     assert.equal(completed.mode, 'inspector-sbom');
@@ -583,9 +586,9 @@ test('Inspector export flows into credential-free Trivy SBOM scan and deletes lo
     assert.ok(calls.every((call) => !call.args.includes('--image-src=remote')));
     await assert.rejects(() => access(exportedPath), { code: 'ENOENT' });
     await assert.rejects(() => access(sbomPath), { code: 'ENOENT' });
-    await assert.rejects(() => fixture.scans.startInspector({ ...target,
-      bucketName: 'security-sboms', keyPrefix: 'a'.repeat(401),
-      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` }),
+    await assert.rejects(() => fixture.scans.saveInspectorDestination({ ...target,
+      destination: { bucketName: 'security-sboms', keyPrefix: 'a'.repeat(401),
+        kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` } }),
     { code: 'INVALID_INPUT' });
   } finally {
     await fixture.scans.dispose();
@@ -610,13 +613,66 @@ test('Inspector export without exact returned filters is rejected before S3 acce
   });
   fixture.aws.listInspectorSbomObject = async () => { listed = true; throw new Error('must not list'); };
   try {
+    await fixture.scans.saveInspectorDestination({ profile: 'role', region: 'us-east-1', destination: {
+      bucketName: 'security-sboms',
+      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` } });
     const started = await fixture.scans.startInspector({ profile: 'role', region: 'us-east-1',
-      repository: 'team/api', digest, platform: 'linux/amd64', bucketName: 'security-sboms',
-      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` });
+      repository: 'team/api', digest, platform: 'linux/amd64' });
     const completed = await waitForTerminal(fixture.scans, started.id);
     assert.equal(completed.status, 'FAILED');
     assert.equal(completed.error.code, 'INSPECTOR_EXPORT_MISMATCH');
     assert.equal(listed, false);
+  } finally {
+    await fixture.scans.dispose();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('Inspector destination is private, durable, and scoped to the verified account, Region, and profile', async () => {
+  const fixture = await scanFixture(async () => { throw new Error('Scanner must not run'); });
+  const target = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest, platform: 'linux/amd64' };
+  const destination = { bucketName: 'security-sboms', keyPrefix: 'team/',
+    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` };
+  let activeAccount = account;
+  fixture.aws.identity = async () => ({ account: activeAccount });
+  try {
+    assert.deepEqual(await fixture.scans.inspectorDestination(target), { configured: false, destination: null });
+    await assert.rejects(() => fixture.scans.startInspector(target), { code: 'INSPECTOR_DESTINATION_NOT_CONFIGURED', status: 409 });
+    assert.deepEqual(await fixture.scans.saveInspectorDestination({ ...target, destination }), {
+      configured: true, destination: { ...destination, keyPrefix: 'team' },
+    });
+    const root = join(fixture.directory, 'settings');
+    assert.equal((await stat(root)).mode & 0o077, 0);
+    assert.equal((await stat(join(root, 'inspector-destinations.json'))).mode & 0o077, 0);
+    const reopened = new TrivyScanService(fixture.aws, { settingsRoot: root });
+    assert.equal((await reopened.inspectorDestination(target)).destination.bucketName, destination.bucketName);
+    const settingsPath = join(root, 'inspector-destinations.json');
+    const savedSettings = await readFile(settingsPath, 'utf8');
+    const editedSettings = JSON.parse(savedSettings);
+    Object.values(editedSettings.destinations)[0].destination.keyPrefix = 'a'.repeat(401);
+    await writeFile(settingsPath, JSON.stringify(editedSettings));
+    await assert.rejects(() => reopened.inspectorDestination(target), { code: 'INSPECTOR_SETTINGS_INVALID' });
+    await writeFile(settingsPath, savedSettings);
+    assert.deepEqual(await reopened.inspectorDestination({ ...target, profile: 'other-role' }),
+      { configured: false, destination: null });
+    assert.deepEqual(await reopened.inspectorDestination({ ...target, region: 'us-west-2' }),
+      { configured: false, destination: null });
+    activeAccount = '210987654321';
+    assert.deepEqual(await reopened.inspectorDestination(target), { configured: false, destination: null });
+    activeAccount = account;
+    await assert.rejects(() => reopened.startInspector({ ...target, ...destination }), { code: 'INVALID_INPUT' });
+    assert.deepEqual(await reopened.deleteInspectorDestination(target), { configured: false, destination: null });
+    assert.deepEqual(await reopened.inspectorDestination(target), { configured: false, destination: null });
+    await chmod(settingsPath, 0o644);
+    await assert.rejects(() => reopened.inspectorDestination(target), { code: 'INSPECTOR_SETTINGS_UNSAFE' });
+    await chmod(settingsPath, 0o600);
+    await writeFile(settingsPath, '{broken');
+    await assert.rejects(() => reopened.inspectorDestination(target), { code: 'INSPECTOR_SETTINGS_INVALID' });
+    await rm(settingsPath);
+    const elsewhere = join(fixture.directory, 'elsewhere.json');
+    await writeFile(elsewhere, '{}', { mode: 0o600 });
+    await symlink(elsewhere, settingsPath);
+    await assert.rejects(() => reopened.inspectorDestination(target), { code: 'INSPECTOR_SETTINGS_UNSAFE' });
   } finally {
     await fixture.scans.dispose();
     await rm(fixture.directory, { recursive: true, force: true });
@@ -890,8 +946,20 @@ test('SBOM API accepts the dedicated upload route and rejects concurrent uploads
 test('Inspector scan API accepts a protected JSON request and returns an existing scan job', async () => {
   const calls = [];
   const scans = {
+    inspectorDestination: async (input) => {
+      calls.push(['get', input]);
+      return { configured: false, destination: null };
+    },
+    saveInspectorDestination: async (input) => {
+      calls.push(['put', input]);
+      return { configured: true, destination: input.destination };
+    },
+    deleteInspectorDestination: async (input) => {
+      calls.push(['delete', input]);
+      return { configured: false, destination: null };
+    },
     startInspector: async (body) => {
-      calls.push(body);
+      calls.push(['scan', body]);
       return { id: '11111111-2222-3333-4444-555555555555', status: 'PENDING', mode: 'inspector-sbom' };
     },
     dispose: async () => {},
@@ -899,21 +967,34 @@ test('Inspector scan API accepts a protected JSON request and returns an existin
   const { server, token } = createAppServer({ aws: {}, scans, token: 'test-token' });
   server.address = () => ({ port: 4173 });
   const body = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest,
-    platform: 'linux/amd64', bucketName: 'security-sboms',
-    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` };
+    platform: 'linux/amd64' };
+  const setting = { profile: 'role', region: 'us-east-1', destination: {
+    bucketName: 'security-sboms', keyPrefix: 'team',
+    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` } };
   const headers = { 'x-ecr-sentinel-token': token, 'content-type': 'application/json' };
+  const settingsPath = '/api/inspector/destination?profile=role&region=us-east-1';
+  assert.equal((await simulatedRequest(server, settingsPath)).status, 403);
+  const before = await simulatedRequest(server, settingsPath, { headers });
+  assert.equal(JSON.parse(before.body).configured, false);
+  const saved = await simulatedRequest(server, '/api/inspector/destination', {
+    method: 'PUT', headers, body: JSON.stringify(setting),
+  });
+  assert.equal(JSON.parse(saved.body).destination.bucketName, setting.destination.bucketName);
   const denied = await simulatedRequest(server, '/api/scans/inspector', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
   assert.equal(denied.status, 403);
-  assert.equal(calls.length, 0);
+  assert.equal(calls.filter(([operation]) => operation === 'scan').length, 0);
   const response = await simulatedRequest(server, '/api/scans/inspector', {
     method: 'POST', headers, body: JSON.stringify(body),
   });
   assert.equal(response.status, 202);
   assert.equal(JSON.parse(response.body).mode, 'inspector-sbom');
-  assert.deepEqual(calls, [body]);
+  assert.deepEqual(calls.find(([operation]) => operation === 'scan'), ['scan', body]);
+  const removed = await simulatedRequest(server, settingsPath, { method: 'DELETE', headers });
+  assert.equal(JSON.parse(removed.body).configured, false);
   assert.equal((await simulatedRequest(server, '/api/scans/inspector', { headers })).status, 405);
+  assert.equal((await simulatedRequest(server, settingsPath, { method: 'POST', headers })).status, 405);
 });
 
 test('MFA API accepts a code only in a protected POST body and returns no secrets', async () => {

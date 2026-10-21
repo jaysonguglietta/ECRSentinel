@@ -1,6 +1,6 @@
 # Development and verification
 
-ECR Sentinel is intentionally small: a Node.js ES module server, static browser UI, AWS CLI adapter, Trivy job service, and build-host SBOM helper. Its Inspector path uses AWS-managed Inspector/S3/KMS resources but deploys none of them. There is no frontend build step, framework, or database.
+ECR Sentinel is intentionally small: a Node.js ES module server, static browser UI, AWS CLI adapter, Trivy job service, private local Inspector destination store, and build-host SBOM helper. Its Inspector path uses AWS-managed Inspector/S3/KMS resources but deploys none of them. There is no frontend build step, framework, or database.
 
 ## Local setup
 
@@ -21,6 +21,7 @@ Use Node.js 20 or newer. The app also needs AWS CLI v2 and Trivy 0.71.1 or newer
 | `server.js` | Loopback server and request gate. |
 | `src/api.js` | Internal JSON routes and body bounds. |
 | `src/aws-cli.js` | Profile, MFA, AWS identity/inventory, Inspector export/S3 retrieval, credentials. |
+| `src/inspector-settings.js` | Private, profile/account/Region-scoped Inspector destination settings. |
 | `src/trivy.js` | Scan queue, Inspector SBOM binding, Trivy execution, normalization, retention. |
 | `public/index.html` | Semantic app structure and dialogs. |
 | `public/styles.css` | Visual system and responsive layout. |
@@ -41,6 +42,7 @@ npm test
 node --check server.js
 node --check src/api.js
 node --check src/aws-cli.js
+node --check src/inspector-settings.js
 node --check src/trivy.js
 node --check public/app.js
 node --check public/auth-guide.js
@@ -56,7 +58,7 @@ The automated suite uses simulated AWS/Trivy behavior and local SBOM fixtures. A
 
 ## Change guidelines
 
-- Keep AWS requests tied to a selected named profile, verified caller account, Region, repository, and immutable digest. Do not accept arbitrary registry URLs from an API request. Inspector exports must always use an exact resource ID filter and a unique S3 prefix.
+- Keep AWS requests tied to a selected named profile, verified caller account, Region, repository, and immutable digest. Do not accept arbitrary registry URLs from an API request. Inspector exports must always use an exact resource ID filter, a unique S3 prefix, and the validated saved destination. The saved destination is operator-writable and is not an administrator allowlist; enforce approved bucket/key/prefix with IAM, S3, and KMS policy.
 - Preserve `execFile`/`spawn` argument arrays and avoid shell interpolation. Bound input, process time, output size, queue depth, and file size before adding new workflows.
 - Update both the UI and server validation when adding an input; server validation is authoritative.
 - Keep database download separate from credential-bearing Trivy image analysis. Neither SBOM path may pass AWS credentials to Trivy. Inspector S3 reads must remain bounded and private, and no raw AWS CLI stderr or SBOM content should enter browser errors.
@@ -67,4 +69,4 @@ The automated suite uses simulated AWS/Trivy behavior and local SBOM fixtures. A
 
 ## Public repository hygiene
 
-Before committing or publishing, inspect the staged file list and diff. Commit only source, tests, documentation, and the lockfile. Keep `node_modules/`, local caches, exported reports, SBOM bundles, screenshots containing account data, `.aws/` files, environment files, launch URLs, and credentials out of the repository. A generated SBOM can reveal private package names and versions even without image layers. See [SECURITY.md](../SECURITY.md) and the [audit](../SECURITY_AUDIT.md).
+Before committing or publishing, inspect the staged file list and diff. Commit only source, tests, documentation, and the lockfile. Keep `node_modules/`, local caches, exported reports, SBOM bundles, screenshots containing account data, `.aws/` files, environment files, launch URLs, credentials, and `inspector-destinations.json` out of the repository. The destination file contains no AWS credentials but can reveal account and storage details; the default location is macOS Application Support outside the checkout. A generated SBOM can reveal private package names and versions even without image layers. See [SECURITY.md](../SECURITY.md) and the [audit](../SECURITY_AUDIT.md).
