@@ -1,0 +1,21 @@
+# Dependencies and local tool output
+node_modules/
+coverage/
+.nyc_output/
+.DS_Store
+*.log
+npm-debug.log*
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.p12
+*.pfx
+
+# Generated scan artifacts
+*.sentinel-sbom.json
+*.trivy.json
+reports/
