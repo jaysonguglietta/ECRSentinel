@@ -2,6 +2,7 @@ import { authenticationGuide } from './auth-guide.js';
 
 const $ = (id) => document.getElementById(id);
 const tokenStorageKey = 'ecr-sentinel-launch-token';
+const inspectorSettingsPrefix = 'ecr-sentinel-inspector-settings:';
 const tokenPattern = /^[0-9a-f]{64}$/i;
 
 function readLaunchToken() {
@@ -36,7 +37,7 @@ const state = {
   report: null, findings: [], reportLoading: false, reportError: null,
   visibleFindings: 100,
   scanJob: null, scanPollTimer: null, scanPollFailures: 0, pollError: null, cancelRequestedId: null,
-  pendingSbomBundle: null, readingSbomFile: false,
+  pendingSbomBundle: null, readingSbomFile: false, inspectorSubmitting: false,
   requestId: 0, repositoryRequestId: 0, findingRequestId: 0, connectionId: 0, activeDialog: null,
   drawerPriorFocus: null, modalPriorFocus: null,
   authMethod: 'standard', authRequestId: 0, roleMfaRequestId: 0,
@@ -57,7 +58,57 @@ const sbomScanPhases = {
   'scanning-sbom': 'Trivy is checking packages listed in the SBOM',
   processing: 'Preparing the SBOM findings report',
 };
+const inspectorScanPhases = {
+  queued: 'Waiting for the local workflow',
+  preflight: 'Checking AWS access and the selected image',
+  'requesting-sbom': 'Requesting the CycloneDX export from Amazon Inspector',
+  'waiting-for-sbom': 'Waiting for Inspector to write the encrypted SBOM to S3; this can take several minutes',
+  'retrieving-sbom': 'Downloading the SBOM and checking its image metadata',
+  'updating-db': 'Preparing vulnerability databases; the first check may take several minutes',
+  'scanning-sbom': 'Trivy is checking packages listed in the Inspector SBOM',
+  processing: 'Preparing the Inspector SBOM findings report',
+};
 const MAX_SBOM_FILE_BYTES = 16 * 1024 * 1024;
+
+function isSbomMode(mode) {
+  return mode === 'sbom' || mode === 'inspector-sbom';
+}
+
+function isInspectorReport(report) {
+  return report?.provenance?.source === 'amazon-inspector' && report?.provenance?.association === 'metadata-verified';
+}
+
+function inspectorSettingsKey() {
+  const account = state.identity?.account;
+  return account && state.profile && state.region
+    ? `${inspectorSettingsPrefix}${account}:${state.region}:${state.profile}` : null;
+}
+
+function loadInspectorSettings() {
+  const key = inspectorSettingsKey();
+  let values = null;
+  try { values = key ? JSON.parse(sessionStorage.getItem(key) || 'null') : null; }
+  catch { /* Ignore invalid tab-local settings. */ }
+  $('inspectorBucket').value = typeof values?.bucketName === 'string' ? values.bucketName.slice(0, 63) : '';
+  $('inspectorKmsArn').value = typeof values?.kmsKeyArn === 'string' ? values.kmsKeyArn.slice(0, 256) : '';
+  $('inspectorPrefix').value = typeof values?.keyPrefix === 'string' ? values.keyPrefix.slice(0, 400) : '';
+}
+
+function saveInspectorSettings(values, key = inspectorSettingsKey()) {
+  if (!key) return;
+  try { sessionStorage.setItem(key, JSON.stringify(values)); }
+  catch { /* The workflow still works if tab storage is unavailable. */ }
+}
+
+function clearInspectorSettings() {
+  try {
+    for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = sessionStorage.key(index);
+      if (key?.startsWith(inspectorSettingsPrefix)) sessionStorage.removeItem(key);
+    }
+  } catch { /* In-memory inputs are cleared below. */ }
+  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).value = '';
+}
 
 function icon(name) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -179,7 +230,7 @@ function showSetup() {
   $('workspace').hidden = true;
   $('headingActions').hidden = true;
   $('pageTitle').textContent = 'Scan your ECR images locally';
-  $('pageSubtitle').textContent = 'Connect an AWS profile, choose an image digest, then scan image layers or import a matching build-host SBOM.';
+  $('pageSubtitle').textContent = 'Connect an AWS profile, choose an image digest, then request an Inspector SBOM, scan image layers, or import a build-host SBOM.';
   $('topbarLocation').textContent = 'Overview';
   $('connectionAccount').textContent = 'Not connected';
   $('connectionMeta').textContent = 'Choose a profile to begin';
@@ -274,7 +325,7 @@ function renderScannerStatus() {
     ? `Trivy ${state.scanner.version || 'is ready'} on this Mac`
     : state.scanner.checkFailed ? 'Could not check Trivy' : 'Trivy is needed for local scanning';
   $('scannerStateDescription').textContent = ready
-    ? 'Trivy scans ECR images when pull access is available, or checks an imported SBOM without downloading image layers. Database updates may need internet access.'
+    ? 'Trivy scans ECR images when pull access is available, or checks an Inspector or imported SBOM without downloading image layers. Database updates may need internet access.'
     : (state.scanner.error || (state.scanner.checkFailed
       ? 'The local app could not verify the scanner. Check again.'
       : 'Install Trivy, then check again. Registry browsing remains available.'));
@@ -491,7 +542,7 @@ function showRepositoryOverview() {
   $('repoOverview').hidden = false;
   $('imagesView').hidden = true;
   $('pageTitle').textContent = 'Registry overview';
-  $('pageSubtitle').textContent = `Explore private ECR repositories in ${state.region}, then scan image layers or check a matching build-host SBOM.`;
+  $('pageSubtitle').textContent = `Explore private ECR repositories in ${state.region}, then request an Inspector SBOM, scan image layers, or import a build-host SBOM.`;
   $('topbarLocation').textContent = 'Overview';
   renderRepositoryNavigation();
   renderRepositoryGrid();
@@ -573,7 +624,7 @@ function renderRepositoryGrid() {
     button.title = `Open ${repo.name}`;
     const top = element('div', 'repository-tile-top');
     top.append(icon('box'), icon('arrow'));
-    button.append(top, element('strong', '', repo.name), element('span', '', 'Private ECR · local scans'));
+    button.append(top, element('strong', '', repo.name), element('span', '', 'Private ECR · Trivy checks'));
     button.addEventListener('click', () => selectRepository(repo));
     return button;
   });
@@ -593,7 +644,7 @@ function selectRepository(repo) {
   $('repoOverview').hidden = true;
   $('imagesView').hidden = false;
   $('pageTitle').textContent = repo.name;
-  $('pageSubtitle').textContent = 'Browse image digests, scan image layers or import a matching SBOM, and inspect Trivy findings.';
+  $('pageSubtitle').textContent = 'Browse image digests, request an Inspector SBOM, scan image layers, or import a build-host SBOM.';
   $('topbarLocation').textContent = repo.name;
   $('imagesTitle').textContent = repo.name;
   $('imagesSubtitle').textContent = repo.uri || 'Private ECR repository';
@@ -713,6 +764,8 @@ function openImage(image) {
   state.scanPollFailures = 0;
   state.pendingSbomBundle = null;
   $('sbomImportError').hidden = true;
+  resetInspectorError();
+  loadInspectorSettings();
   state.drawerPriorFocus = document.activeElement;
   $('drawerTitle').textContent = image.tags?.[0] || 'Untagged image';
   $('drawerProfile').textContent = `AWS profile: ${state.profile} · ${state.region}`;
@@ -750,6 +803,88 @@ function closeDrawer() {
 function currentScanKey() {
   return [state.profile, state.region, state.repository?.name, state.image?.digest,
     $('platformSelect').value].join('\n');
+}
+
+function resetInspectorError() {
+  $('inspectorError').hidden = true;
+  $('inspectorError').textContent = '';
+  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) $(id).removeAttribute('aria-invalid');
+}
+
+function showInspectorError(message, fieldId = null) {
+  resetInspectorError();
+  $('inspectorError').textContent = message;
+  $('inspectorError').hidden = false;
+  if (fieldId) {
+    $(fieldId).setAttribute('aria-invalid', 'true');
+    $(fieldId).focus();
+  } else $('inspectorError').focus();
+}
+
+function inspectorExportValues() {
+  const bucketName = $('inspectorBucket').value.trim();
+  const kmsKeyArn = $('inspectorKmsArn').value.trim();
+  const keyPrefix = $('inspectorPrefix').value.trim();
+  if (!bucketName) throw { message: 'Enter the approved S3 bucket for Inspector SBOM exports.', fieldId: 'inspectorBucket' };
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucketName) || bucketName.includes('..') || /\.\-|\-\./.test(bucketName) || /^\d+\.\d+\.\d+\.\d+$/.test(bucketName)) {
+    throw { message: 'Enter a valid S3 bucket name (3–63 lowercase letters, numbers, dots, or hyphens).', fieldId: 'inspectorBucket' };
+  }
+  if (!kmsKeyArn) throw { message: 'Enter the KMS key ARN approved for Inspector SBOM exports.', fieldId: 'inspectorKmsArn' };
+  const partition = state.region.startsWith('cn-') ? 'aws-cn' : state.region.startsWith('us-gov-') ? 'aws-us-gov' : 'aws';
+  const kmsMatch = /^arn:(aws|aws-us-gov|aws-cn):kms:([a-z0-9-]+):\d{12}:key\/([A-Za-z0-9-]{8,128})$/.exec(kmsKeyArn);
+  if (kmsKeyArn.length > 256 || !kmsMatch || kmsMatch[1] !== partition || kmsMatch[2] !== state.region) {
+    throw { message: `Enter a KMS key ARN for the selected AWS Region (${state.region}).`, fieldId: 'inspectorKmsArn' };
+  }
+  if (keyPrefix.length > 400 || (keyPrefix && (!/^[A-Za-z0-9!_.*'()/-]+$/.test(keyPrefix) || keyPrefix.startsWith('/') || keyPrefix.split('/').includes('..')))) {
+    throw { message: 'Use an S3 prefix up to 400 characters with letters, numbers, ! _ . * apostrophe ( ) / or hyphen. Do not start with / or use a parent path segment.', fieldId: 'inspectorPrefix' };
+  }
+  return { bucketName, kmsKeyArn, keyPrefix };
+}
+
+async function startInspectorExport(event) {
+  event.preventDefault();
+  if (state.inspectorSubmitting || !state.scanner.available || !state.image || !state.repository ||
+    state.image.status === 'ARCHIVED' || state.reportLoading || state.readingSbomFile || state.activeDialog ||
+    ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status)) return;
+  let values;
+  try { values = inspectorExportValues(); }
+  catch (error) { showInspectorError(error.message, error.fieldId); return; }
+  resetInspectorError();
+  const key = currentScanKey();
+  const settingsKey = inspectorSettingsKey();
+  const connectionId = state.connectionId;
+  state.inspectorSubmitting = true;
+  renderScanStatus();
+  try {
+    const job = await api('/api/scans/inspector', {
+      method: 'POST',
+      body: JSON.stringify({
+        profile: state.profile, region: state.region, repository: state.repository.name,
+        digest: state.image.digest, platform: $('platformSelect').value, ...values,
+      }),
+      timeoutMs: 90000,
+    });
+    if (apiToken && connectionId === state.connectionId) saveInspectorSettings(values, settingsKey);
+    if (connectionId === state.connectionId && key === currentScanKey() && !$('findingDrawer').hidden) {
+      state.findingRequestId += 1;
+      state.reportLoading = false;
+      state.scanJob = job;
+      state.scanPollFailures = 0;
+      state.pollError = null;
+      state.cancelRequestedId = null;
+      renderScanStatus();
+      renderFindings();
+      scheduleScanPoll();
+    }
+    if (apiToken && connectionId === state.connectionId) toast('Inspector SBOM workflow started. Trivy will check the listed packages when the export is ready.');
+  } catch (error) {
+    if (error.code !== 'INVALID_API_TOKEN' && connectionId === state.connectionId && key === currentScanKey() && !$('findingDrawer').hidden) {
+      showInspectorError(error.message || 'Could not start the Inspector export. Check the image and S3/KMS permissions, then try again.');
+    }
+  } finally {
+    state.inspectorSubmitting = false;
+    if (!$('findingDrawer').hidden) renderScanStatus();
+  }
 }
 
 async function loadLatestReport() {
@@ -794,24 +929,27 @@ async function loadLatestReport() {
 function renderScanStatus() {
   const job = state.scanJob;
   const report = state.report;
-  const sbomJob = job?.mode === 'sbom';
+  const inspectorJob = job?.mode === 'inspector-sbom';
+  const sbomJob = isSbomMode(job?.mode);
   const sbomReport = report?.scanMode === 'sbom';
+  const inspectorReport = isInspectorReport(report);
   const active = job && ['PENDING', 'IN_PROGRESS'].includes(job.status);
   let title = 'No local report yet';
-  let description = 'Scan the image with Trivy, or import a matching SBOM bundle from an authorized build host.';
+  let description = 'Request an Inspector SBOM, scan image layers with Trivy, or import a matching build-host SBOM.';
   let tone = 'warn';
   if (state.reportLoading) {
     title = 'Checking local report history';
     description = 'Looking for an earlier image or SBOM report from this app session.';
   } else if (active) {
     const stopping = state.cancelRequestedId === job.id;
+    const exporting = inspectorJob && !['updating-db', 'scanning-sbom', 'processing'].includes(job.phase);
     title = stopping ? 'Stopping local check' : job.status === 'PENDING' ? 'Check queued'
-      : sbomJob ? 'SBOM check running' : 'Trivy image scan running';
+      : exporting ? 'Inspector SBOM export in progress' : sbomJob ? 'Trivy SBOM check running' : 'Trivy image scan running';
     description = state.pollError
       ? `Could not refresh progress: ${state.pollError} Use Refresh to retry.`
-      : `${stopping ? 'Waiting for the Trivy process to stop' : (sbomJob ? sbomScanPhases : scanPhases)[job.phase] || (sbomJob ? 'Trivy is checking this SBOM' : 'Trivy is working on this image')}.${report ? ' Showing the previous completed report below.' : ''}`;
+      : `${stopping ? inspectorJob ? 'Stopping this local workflow; the AWS export may still finish' : 'Waiting for the Trivy process to stop' : (inspectorJob ? inspectorScanPhases : sbomJob ? sbomScanPhases : scanPhases)[job.phase] || (sbomJob ? 'Trivy is checking this SBOM' : 'Trivy is working on this image')}.${report ? ' Showing the previous completed report below.' : ''}`;
   } else if (job?.status === 'FAILED' || job?.status === 'CANCELED') {
-    title = job.status === 'FAILED' ? (sbomJob ? 'SBOM check failed' : 'Image scan failed') : 'Check canceled';
+    title = job.status === 'FAILED' ? (inspectorJob ? 'Inspector SBOM workflow failed' : sbomJob ? 'SBOM check failed' : 'Image scan failed') : 'Check canceled';
     description = `${job.error?.message || 'The local check did not complete.'}${report ? ' The previous completed report is shown below.' : ' Retry when ready.'}`;
     tone = job.status === 'FAILED' ? 'error' : 'warn';
   } else if (state.reportError) {
@@ -822,12 +960,14 @@ function renderScanStatus() {
     title = 'Earlier report expired from this session';
     description = 'This image was scanned, but its detailed report is no longer in local app memory. Rescan to view findings.';
   } else if (report) {
-    title = sbomReport ? 'SBOM vulnerability check complete' : 'Local Trivy image scan complete';
+    title = inspectorReport ? 'Inspector SBOM vulnerability check complete' : sbomReport ? 'SBOM vulnerability check complete' : 'Local Trivy image scan complete';
     description = report.coverage?.noPackagesDetected
       ? `Trivy detected no package targets in ${sbomReport ? 'this SBOM' : 'this image'}. This report cannot establish whether the image has known package vulnerabilities.`
       : report.coverage?.limitedCoverage
         ? `Trivy checked the package types shown below. Coverage is limited to ${sbomReport ? 'packages recorded in the SBOM' : 'targets it detected in the image'}.`
-        : sbomReport
+        : inspectorReport
+          ? 'Trivy checked packages in the Inspector export. Its metadata matched this account, image digest, and platform; package completeness is not attested.'
+          : sbomReport
           ? 'Trivy checked the packages recorded in the imported SBOM. The bundle’s image association and producer are unverified claims.'
           : 'These findings came from Trivy on this Mac for the selected digest and platform.';
     tone = report.coverage?.noPackagesDetected ? 'warn' : 'good';
@@ -859,15 +999,20 @@ function renderScanStatus() {
   if (report) {
     $('reportScanner').textContent = `${report.source || 'Trivy'} ${report.scannerVersion || ''}`.trim();
     $('reportDbDate').textContent = formatDate(report.dbUpdatedAt, true);
-    $('reportImageLabel').textContent = sbomReport ? 'Claimed image' : 'Image';
+    $('reportImageLabel').textContent = inspectorReport ? 'Inspector export image' : sbomReport ? 'Claimed image' : 'Image';
     $('reportImage').textContent = `${shortDigest(report.digest || state.image?.digest)} · ${report.platform || $('platformSelect').value}`;
     $('reportImage').title = report.digest || state.image?.digest || '';
     if (sbomReport) {
       const producer = report.provenance?.producer;
       const producerName = typeof producer === 'string' ? producer : producer?.name;
-      $('reportSbomProducer').textContent = `${producerName || 'Unspecified'} · ${formatDate(report.provenance?.generatedAt, true)} (bundle claim)`;
+      $('reportSbomProducerLabel').textContent = inspectorReport ? 'Inspector SBOM producer' : 'SBOM producer claim';
+      $('reportSbomProducer').textContent = `${producerName || 'Unspecified'} · ${formatDate(report.provenance?.generatedAt, true)}${inspectorReport ? '' : ' (bundle claim)'}`;
       $('reportSbomHash').textContent = report.provenance?.sbomSha256 || 'Unavailable';
     }
+    $('reportSbomAssociation').classList.toggle('inspector-verified', inspectorReport);
+    $('reportSbomAssociation').textContent = inspectorReport
+      ? 'Amazon Inspector export metadata matched this AWS account, image digest, and platform. This is metadata validation, not cryptographic attestation that every image package is present.'
+      : 'SBOM producer and image association are claims in the imported file. They have not been cryptographically verified.';
     const packageTypes = Array.isArray(report.coverage?.packageTypes) ? report.coverage.packageTypes : [];
     $('reportCoverage').textContent = report.coverage?.noPackagesDetected
       ? 'No package targets detected'
@@ -878,16 +1023,29 @@ function renderScanStatus() {
 
   const button = $('startScanButton');
   button.replaceChildren(icon('scan'), document.createTextNode('Scan image with Trivy'));
-  button.disabled = !state.scanner.available || !state.image || state.image.status === 'ARCHIVED' || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog);
-  $('importSbomButton').disabled = !state.scanner.available || !state.image || !state.repository || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog);
+  button.disabled = !state.scanner.available || !state.image || state.image.status === 'ARCHIVED' || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
+  $('importSbomButton').disabled = !state.scanner.available || !state.image || !state.repository || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
+  $('platformSelect').disabled = state.inspectorSubmitting;
+  $('refreshFindingsButton').disabled = state.inspectorSubmitting;
+  $('drawerChangeConnectionButton').disabled = state.inspectorSubmitting;
+  const inspectorButton = $('startInspectorButton');
+  inspectorButton.replaceChildren(icon('scan'), document.createTextNode(state.inspectorSubmitting ? 'Requesting export…' : 'Export SBOM and check CVEs'));
+  inspectorButton.disabled = !state.scanner.available || !state.image || !state.repository || state.image.status === 'ARCHIVED' || Boolean(active) || state.reportLoading || state.readingSbomFile || Boolean(state.activeDialog) || state.inspectorSubmitting;
+  $('inspectorActionHint').textContent = state.inspectorSubmitting ? 'Sending the request to Amazon Inspector…'
+    : active ? 'Finish or cancel the current check before starting another.'
+      : state.reportLoading ? 'Checking for an existing local job…'
+        : !state.scanner.available ? 'Install Trivy and check again to enable this workflow.'
+          : state.image?.status === 'ARCHIVED' ? 'Archived images are unavailable for Inspector export.'
+            : 'Only the SBOM is downloaded to this Mac.';
   $('cancelRunningScanButton').hidden = !active;
+  $('cancelRunningScanButton').textContent = inspectorJob ? 'Stop local workflow' : 'Cancel scan';
   $('cancelRunningScanButton').disabled = !job?.id || state.cancelRequestedId === job.id;
   $('drawerScanHint').textContent = state.image?.status === 'ARCHIVED'
     ? 'Image layers are archived. A matching SBOM bundle can still be checked locally.'
-    : active ? 'This check continues on your Mac if you close the report.'
+    : active ? inspectorJob ? 'The Inspector export and local check continue if you close the report.' : 'This check continues on your Mac if you close the report.'
       : !state.scanner.available ? (state.scanner.checkFailed
-        ? 'Check the local scanner again to enable both scan paths.' : 'Install Trivy and check again to enable both scan paths.')
-        : 'Import a matching SBOM bundle to check packages without downloading image layers.';
+        ? 'Check the local scanner again to enable the scan paths.' : 'Install Trivy and check again to enable the scan paths.')
+        : 'The Inspector and imported SBOM paths check packages without downloading image layers.';
 }
 
 function renderSeverity() {
@@ -987,25 +1145,31 @@ function renderFindings() {
   $('findingsEmpty').hidden = findings.length > 0;
   if (!findings.length) {
     const sbomReport = state.report?.scanMode === 'sbom';
+    const inspectorReport = isInspectorReport(state.report);
     if (state.report && (query || severity !== 'ALL')) {
       $('findingsEmptyTitle').textContent = 'No matching findings';
       $('findingsEmptyText').textContent = 'Try a different advisory, package, target, or severity filter.';
     } else if (state.report?.coverage?.noPackagesDetected) {
       $('findingsEmptyTitle').textContent = 'No package targets detected';
       $('findingsEmptyText').textContent = sbomReport
-        ? 'The imported SBOM contains no package targets Trivy could check. Zero findings do not establish image vulnerability coverage.'
+        ? `The ${inspectorReport ? 'Inspector export' : 'imported SBOM'} contains no package targets Trivy could check. Zero findings do not establish image vulnerability coverage.`
         : 'Trivy completed but found no OS or library package targets for this platform. A zero-finding result here does not establish vulnerability coverage.';
     } else if (state.report) {
       $('findingsEmptyTitle').textContent = 'No known vulnerabilities found';
       $('findingsEmptyText').textContent = sbomReport
-        ? 'Trivy found no known vulnerabilities in packages recorded in this SBOM using the recorded database. Other packages may be absent, and the image association is unverified.'
+        ? inspectorReport
+          ? 'Trivy found no known vulnerabilities in packages recorded in this Inspector SBOM using the recorded database. Other packages may be absent, even though the export metadata matched this image.'
+          : 'Trivy found no known vulnerabilities in packages recorded in this SBOM using the recorded database. Other packages may be absent, and the image association is unverified.'
         : 'Trivy found no known package vulnerabilities for this digest and platform using the recorded database. This is not a guarantee that the image is vulnerability free.';
     } else if (state.reportLoading) {
       $('findingsEmptyTitle').textContent = 'Checking local history';
       $('findingsEmptyText').textContent = 'Looking for an earlier scan of this digest and platform.';
     } else if (state.scanJob && ['PENDING', 'IN_PROGRESS'].includes(state.scanJob.status)) {
-      $('findingsEmptyTitle').textContent = state.scanJob.mode === 'sbom' ? 'SBOM check in progress' : 'Image scan in progress';
-      $('findingsEmptyText').textContent = 'Findings will appear when Trivy completes.';
+      $('findingsEmptyTitle').textContent = state.scanJob.mode === 'inspector-sbom' ? 'Inspector SBOM workflow in progress'
+        : isSbomMode(state.scanJob.mode) ? 'SBOM check in progress' : 'Image scan in progress';
+      $('findingsEmptyText').textContent = state.scanJob.mode === 'inspector-sbom'
+        ? 'Findings will appear after Inspector exports the SBOM and Trivy checks its packages.'
+        : 'Findings will appear when Trivy completes.';
     } else if (state.reportError) {
       $('findingsEmptyTitle').textContent = 'Could not load scan history';
       $('findingsEmptyText').textContent = state.reportError;
@@ -1020,7 +1184,7 @@ function renderFindings() {
       $('findingsEmptyText').textContent = 'The completed report is no longer in this app session. Rescan this digest and platform to view findings.';
     } else {
       $('findingsEmptyTitle').textContent = 'No local report yet';
-      $('findingsEmptyText').textContent = 'Scan image layers with Trivy, or import a matching SBOM bundle to check its recorded packages.';
+      $('findingsEmptyText').textContent = 'Request an Inspector SBOM, scan image layers with Trivy, or import a matching build-host SBOM.';
     }
   }
 }
@@ -1052,8 +1216,10 @@ async function pollScanJob() {
         state.visibleFindings = 100;
         renderSeverity();
         renderFindings();
-        toast(job.report.scanMode === 'sbom'
-          ? 'SBOM vulnerability check complete. The report is ready.'
+        toast(isInspectorReport(job.report)
+          ? 'Inspector SBOM check complete. The Trivy findings report is ready.'
+          : job.report.scanMode === 'sbom'
+            ? 'SBOM vulnerability check complete. The report is ready.'
           : 'Local Trivy image scan complete. The report is ready.');
       } else {
         await loadLatestReport();
@@ -1085,17 +1251,18 @@ function exportFindings() {
   if (!state.report || !state.image || !state.repository) return;
   const report = state.report;
   const sbomReport = report.scanMode === 'sbom';
+  const inspectorReport = isInspectorReport(report);
   const producer = report.provenance?.producer;
   const producerName = typeof producer === 'string' ? producer : producer?.name;
-  const header = ['Report status', 'Scan input', 'Scanner', 'Scanner version', 'Database updated', 'Scanned at', 'AWS account', 'Region', 'Repository', 'Reported image digest', 'Platform', 'Normalized SBOM SHA-256', 'SBOM producer claim', 'SBOM generated at claim', 'Image association', 'Package types detected', 'Coverage note', 'Target', 'Package type', 'Severity', 'CVE / advisory ID', 'Title', 'Package', 'Installed version', 'Fixed version', 'CVSS', 'Advisory URL'];
+  const header = ['Report status', 'Scan input', 'Scanner', 'Scanner version', 'Database updated', 'Scanned at', 'AWS account', 'Region', 'Repository', 'Reported image digest', 'Platform', 'Normalized SBOM SHA-256', 'SBOM producer', 'SBOM generated at', 'Image association', 'Package types detected', 'Coverage note', 'Target', 'Package type', 'Severity', 'CVE / advisory ID', 'Title', 'Package', 'Installed version', 'Fixed version', 'CVSS', 'Advisory URL'];
   const rows = state.findings.length ? state.findings : [{}];
   const lines = [header, ...rows.map((finding) => [
-    'COMPLETE', sbomReport ? 'Imported SBOM' : 'ECR image layers', report.source || 'Trivy', report.scannerVersion, report.dbUpdatedAt, report.scannedAt,
+    'COMPLETE', inspectorReport ? 'Amazon Inspector SBOM export' : sbomReport ? 'Imported SBOM' : 'ECR image layers', report.source || 'Trivy', report.scannerVersion, report.dbUpdatedAt, report.scannedAt,
     report.account || state.identity?.account, report.region || state.region,
     report.repository || state.repository.name, report.digest || state.image.digest,
     report.platform || $('platformSelect').value,
     sbomReport ? report.provenance?.sbomSha256 : '', sbomReport ? producerName : '',
-    sbomReport ? report.provenance?.generatedAt : '', sbomReport ? 'Unverified producer assertion' : 'Image read by Trivy',
+    sbomReport ? report.provenance?.generatedAt : '', inspectorReport ? 'Inspector export metadata matched selected image' : sbomReport ? 'Unverified producer assertion' : 'Image read by Trivy',
     Array.isArray(report.coverage?.packageTypes) ? report.coverage.packageTypes.join(' + ') : '',
     report.coverage?.note || '', finding.target, finding.type,
     finding.severity, finding.id, finding.title, finding.packageName,
@@ -1106,7 +1273,7 @@ function exportFindings() {
   const link = element('a');
   link.href = url;
   const safeRepo = state.repository.name.replaceAll('/', '-').replace(/[^a-z0-9._-]/gi, '_');
-  link.download = `trivy-${sbomReport ? 'sbom' : 'image'}-report-${safeRepo}-${state.image.digest.slice(-12)}-${(report.platform || $('platformSelect').value).replace('/', '-')}.csv`;
+  link.download = `trivy-${inspectorReport ? 'inspector-sbom' : sbomReport ? 'sbom' : 'image'}-report-${safeRepo}-${state.image.digest.slice(-12)}-${(report.platform || $('platformSelect').value).replace('/', '-')}.csv`;
   document.body.append(link);
   link.click();
   link.remove();
@@ -1195,7 +1362,7 @@ async function selectSbomBundle(event) {
 
 function openScanConfirmation() {
   if (!state.image || !state.repository || !state.scanner.available || state.image.status === 'ARCHIVED' ||
-    ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status) || state.readingSbomFile) return;
+    ['PENDING', 'IN_PROGRESS'].includes(state.scanJob?.status) || state.readingSbomFile || state.inspectorSubmitting) return;
   state.activeDialog = 'start';
   state.modalPriorFocus = document.activeElement;
   $('confirmTitle').textContent = state.report || state.scanJob?.status === 'COMPLETE' ? 'Rescan this image locally?' : 'Scan this image locally?';
@@ -1213,11 +1380,14 @@ function openCancelConfirmation() {
   if (!state.scanJob?.id || !['PENDING', 'IN_PROGRESS'].includes(state.scanJob.status)) return;
   state.activeDialog = 'cancel';
   state.modalPriorFocus = document.activeElement;
-  $('confirmTitle').textContent = state.scanJob.mode === 'sbom' ? 'Cancel this SBOM check?' : 'Cancel this local image scan?';
-  $('confirmText').textContent = 'The Trivy process will stop. An earlier completed report, if available, will remain visible in this app session.';
+  $('confirmTitle').textContent = state.scanJob.mode === 'inspector-sbom' ? 'Stop this Inspector SBOM workflow?'
+    : isSbomMode(state.scanJob.mode) ? 'Cancel this SBOM check?' : 'Cancel this local image scan?';
+  $('confirmText').textContent = state.scanJob.mode === 'inspector-sbom'
+    ? 'The local job will stop. An export already requested from Inspector may still finish in AWS. An earlier completed report, if available, will remain visible.'
+    : 'The Trivy process will stop. An earlier completed report, if available, will remain visible in this app session.';
   $('confirmTarget').textContent = `${state.repository.name}@${state.image.digest} · ${$('platformSelect').value}`;
-  $('cancelScanButton').textContent = 'Keep scanning';
-  $('confirmScanButton').textContent = 'Cancel scan';
+  $('cancelScanButton').textContent = 'Keep checking';
+  $('confirmScanButton').textContent = state.scanJob.mode === 'inspector-sbom' ? 'Stop local workflow' : 'Cancel scan';
   $('confirmModal').hidden = false;
   $('confirmBackdrop').hidden = false;
   renderScanStatus();
@@ -1305,6 +1475,7 @@ async function confirmSbomScan() {
 
 async function confirmCancelScan() {
   const jobId = state.scanJob?.id;
+  const inspectorJob = state.scanJob?.mode === 'inspector-sbom';
   if (!jobId) return;
   const key = currentScanKey();
   const button = $('confirmScanButton');
@@ -1322,7 +1493,9 @@ async function confirmCancelScan() {
       renderFindings();
       if (['PENDING', 'IN_PROGRESS'].includes(job.status)) scheduleScanPoll();
     }
-    toast(job.status === 'CANCELED' ? 'Local scan canceled.' : 'Cancellation requested. Waiting for Trivy to stop.');
+    toast(inspectorJob
+      ? job.status === 'CANCELED' ? 'Local Inspector workflow stopped. An AWS export may still finish.' : 'Stopping the local job; an AWS export may still finish.'
+      : job.status === 'CANCELED' ? 'Local scan canceled.' : 'Cancellation requested. Waiting for Trivy to stop.');
   } catch (error) {
     if (error.code === 'INVALID_API_TOKEN') return;
     toast(error.message, true);
@@ -1375,6 +1548,7 @@ function changeConnection() {
 function init() {
   $('lockTabButton').addEventListener('click', () => {
     apiToken = '';
+    clearInspectorSettings();
     try {
       sessionStorage.removeItem(tokenStorageKey);
       sessionStorage.removeItem('ecr-sentinel-connection');
@@ -1453,6 +1627,7 @@ function init() {
     state.pollError = null;
     state.pendingSbomBundle = null;
     $('sbomImportError').hidden = true;
+    resetInspectorError();
     renderSeverity();
     renderFindings();
     loadLatestReport();
@@ -1467,6 +1642,10 @@ function init() {
     $('sbomFileInput').click();
   });
   $('sbomFileInput').addEventListener('change', selectSbomBundle);
+  $('inspectorExportForm').addEventListener('submit', startInspectorExport);
+  for (const id of ['inspectorBucket', 'inspectorKmsArn', 'inspectorPrefix']) {
+    $(id).addEventListener('input', resetInspectorError);
+  }
   $('startScanButton').addEventListener('click', openScanConfirmation);
   $('cancelRunningScanButton').addEventListener('click', openCancelConfirmation);
   $('confirmBackdrop').addEventListener('click', closeScanConfirmation);

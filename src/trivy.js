@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AwsCliError, validateDigest, validateRegion, validateRepository } from './aws-cli.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { AwsCliError, validateDigest, validateInspectorDestination, validateRegion, validateRepository } from './aws-cli.js';
 
 const PLATFORM_RE = /^[a-z0-9]+\/[a-z0-9]+(?:\/[a-z0-9._-]+)?$/;
 const ACCOUNT_RE = /^\d{12}$/;
@@ -20,6 +21,8 @@ const DB_REFRESH_MS = 6 * 60 * 60 * 1000;
 const SCAN_TIMEOUT_MS = 15 * 60 * 1000;
 const JOB_TIMEOUT_MS = 30 * 60 * 1000;
 const STATUS_CACHE_MS = 30_000;
+const INSPECTOR_POLL_MS = 5_000;
+const INSPECTOR_EXPORT_TIMEOUT_MS = 12 * 60 * 1000;
 
 export function validatePlatform(value) {
   const platform = value === undefined || value === null || value === '' ? 'linux/amd64' : value;
@@ -160,8 +163,9 @@ export function normalizeTrivyReport(raw, context) {
     imageRef: context.imageRef,
     ...(fromSbom ? { provenance: {
       sbomSha256: context.sbomSha256,
-      bundleSha256: context.bundleSha256,
-      association: 'unverified',
+      ...(context.bundleSha256 ? { bundleSha256: context.bundleSha256 } : {}),
+      association: context.sbomAssociation ?? 'unverified',
+      ...(context.sbomSource ? { source: context.sbomSource } : {}),
       generatedAt: context.generatedAt,
       producer: context.producer,
       format: context.sbomFormat,
@@ -176,9 +180,13 @@ export function normalizeTrivyReport(raw, context) {
       limitedCoverage: packageTypes.size < 2,
       offlineDependencyResolution: true,
       note: fromSbom
-        ? packageTypes.size === 0
-          ? 'Trivy found no supported package targets in this SBOM. The bundle\'s association with this image is unverified; zero findings do not establish image coverage.'
-          : 'Findings cover packages listed in the imported SBOM. Its association with this ECR digest and platform is producer-asserted, not cryptographically verified. Missing packages will not be scanned.'
+        ? context.sbomSource === 'amazon-inspector'
+          ? packageTypes.size === 0
+            ? 'Trivy found no supported package targets in the Inspector SBOM. The export metadata matches this image, but zero findings do not establish image coverage.'
+            : 'Findings cover packages listed in the Inspector SBOM. Export filters and SBOM metadata match this ECR digest and platform; the inventory is not cryptographically attested. Missing packages will not be scanned.'
+          : packageTypes.size === 0
+            ? 'Trivy found no supported package targets in this SBOM. The bundle\'s association with this image is unverified; zero findings do not establish image coverage.'
+            : 'Findings cover packages listed in the imported SBOM. Its association with this ECR digest and platform is producer-asserted, not cryptographically verified. Missing packages will not be scanned.'
         : packageTypes.size === 0
           ? 'Trivy did not detect OS or language packages in this image. Zero findings do not establish that the image is vulnerability-free.'
           : 'Remote Maven dependency lookup is disabled; some Java dependencies may not be identified.',
@@ -331,18 +339,7 @@ function keyFor({ profile, account, region, repository, digest, platform }) {
   return createHash('sha256').update(JSON.stringify([profile, account, region, repository, digest, platform])).digest('hex');
 }
 
-function validateSbomBundle(bundle, target, account) {
-  if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle) || bundle.schemaVersion !== 1) {
-    throw new AwsCliError(422, 'SBOM_BUNDLE_INVALID', 'Select a version 1 ECR Sentinel SBOM bundle in JSON format.');
-  }
-  const image = bundle.image;
-  if (!image || typeof image !== 'object' || Array.isArray(image)
-    || image.account !== account || image.region !== target.region
-    || image.repository !== target.repository || image.digest !== target.digest
-    || image.platform !== target.platform) {
-    throw new AwsCliError(422, 'SBOM_TARGET_MISMATCH', 'This SBOM bundle declares a different account, repository, digest, or platform. Select the matching image and platform.');
-  }
-  const sbom = bundle.sbom;
+function validateSbomDocument(sbom, target, account) {
   if (!sbom || typeof sbom !== 'object' || Array.isArray(sbom)) {
     throw new AwsCliError(422, 'SBOM_BUNDLE_INVALID', 'The bundle does not contain a JSON SBOM.');
   }
@@ -383,6 +380,21 @@ function validateSbomBundle(bundle, target, account) {
   if (Buffer.byteLength(sbomJson) > MAX_SBOM_BYTES) {
     throw new AwsCliError(413, 'SBOM_TOO_LARGE', 'The SBOM exceeds the 16 MiB local import limit.');
   }
+  return { sbomJson, format, sbomSha256: createHash('sha256').update(sbomJson).digest('hex') };
+}
+
+function validateSbomBundle(bundle, target, account) {
+  if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle) || bundle.schemaVersion !== 1) {
+    throw new AwsCliError(422, 'SBOM_BUNDLE_INVALID', 'Select a version 1 ECR Sentinel SBOM bundle in JSON format.');
+  }
+  const image = bundle.image;
+  if (!image || typeof image !== 'object' || Array.isArray(image)
+    || image.account !== account || image.region !== target.region
+    || image.repository !== target.repository || image.digest !== target.digest
+    || image.platform !== target.platform) {
+    throw new AwsCliError(422, 'SBOM_TARGET_MISMATCH', 'This SBOM bundle declares a different account, repository, digest, or platform. Select the matching image and platform.');
+  }
+  const { sbomJson, format, sbomSha256 } = validateSbomDocument(bundle.sbom, target, account);
   const generatedAt = typeof bundle.generatedAt === 'string' && bundle.generatedAt.length <= 64
     && Number.isFinite(Date.parse(bundle.generatedAt)) ? new Date(bundle.generatedAt).toISOString() : null;
   const producer = bundle.producer && typeof bundle.producer === 'object' && !Array.isArray(bundle.producer)
@@ -391,7 +403,6 @@ function validateSbomBundle(bundle, target, account) {
   if (!generatedAt || !producer.name.trim() || !producer.trivyVersion.trim()) {
     throw new AwsCliError(422, 'SBOM_BUNDLE_INVALID', 'The bundle needs a valid generation time and producer details. Generate it on the authorized build host.');
   }
-  const sbomSha256 = createHash('sha256').update(sbomJson).digest('hex');
   const bundleSha256 = createHash('sha256').update(JSON.stringify([
     account, target.region, target.repository, target.digest, target.platform,
     generatedAt, producer.name, producer.trivyVersion, sbomSha256,
@@ -401,6 +412,49 @@ function validateSbomBundle(bundle, target, account) {
     sbomSha256, bundleSha256,
     generatedAt, producer,
   };
+}
+
+export function validateInspectorSbom(sbom, target, account) {
+  if (!sbom || typeof sbom !== 'object' || Array.isArray(sbom)
+    || sbom.bomFormat !== 'CycloneDX' || sbom.specVersion !== '1.4'
+    || !Array.isArray(sbom.components)) {
+    throw new AwsCliError(422, 'INSPECTOR_SBOM_INVALID', 'Inspector did not export a CycloneDX 1.4 JSON SBOM for one image.');
+  }
+  const metadata = sbom.metadata;
+  const properties = metadata?.properties;
+  if (!Array.isArray(properties) || properties.length > 128) {
+    throw new AwsCliError(422, 'INSPECTOR_SBOM_UNBOUND', 'The Inspector SBOM is missing image identity metadata.');
+  }
+  const required = ['imageId', 'accountId', 'resourceType', 'architecture'];
+  const values = {};
+  for (const name of required) {
+    const matches = properties.filter((item) => item?.name === name);
+    if (matches.length !== 1 || typeof matches[0].value !== 'string') {
+      throw new AwsCliError(422, 'INSPECTOR_SBOM_UNBOUND', 'The Inspector SBOM has missing or ambiguous image identity metadata.');
+    }
+    values[name] = matches[0].value;
+  }
+  const requestedArch = target.platform.split('/')[1];
+  if (values.imageId !== target.digest || values.accountId !== account
+    || values.resourceType !== 'AWS_ECR_CONTAINER_IMAGE' || values.architecture !== requestedArch) {
+    throw new AwsCliError(422, 'INSPECTOR_SBOM_TARGET_MISMATCH',
+      'The Inspector SBOM identifies a different account, image digest, resource type, or architecture. Select the exact image manifest and platform.');
+  }
+  // Inspector identifies architecture but does not attest OS or variant in its
+  // published CycloneDX metadata. Reject variants rather than claiming a match.
+  if (target.platform !== `linux/${requestedArch}`) {
+    throw new AwsCliError(422, 'INSPECTOR_SBOM_PLATFORM_UNVERIFIED',
+      'Inspector does not identify this OS or platform variant in its SBOM metadata. Choose the matching linux architecture without a variant.');
+  }
+  const timestamp = metadata.timestamp;
+  if (typeof timestamp !== 'string' || timestamp.length > 64 || !Number.isFinite(Date.parse(timestamp))) {
+    throw new AwsCliError(422, 'INSPECTOR_SBOM_INVALID', 'The Inspector SBOM is missing a valid generation time.');
+  }
+  const base = validateSbomDocument(sbom, target, account);
+  const generatedAt = new Date(timestamp).toISOString();
+  const producer = { name: 'Amazon Inspector SBOM Generator' };
+  return { ...base, generatedAt, producer,
+    association: 'metadata-verified', source: 'amazon-inspector' };
 }
 
 function verifyRepositoryUri(item, identity, repository, region) {
@@ -540,17 +594,39 @@ export class TrivyScanService {
     return this.enqueue(target, identity.account, 'sbom', sbom);
   }
 
-  enqueue(target, account, mode, sbom = null) {
+  async startInspector(input) {
+    const target = this.validateTarget(input);
+    if (target.platform.split('/').length !== 2 || !target.platform.startsWith('linux/')) {
+      throw new AwsCliError(422, 'INSPECTOR_SBOM_PLATFORM_UNVERIFIED',
+        'Inspector identifies image architecture but not OS or variant. Select a linux platform without a variant.');
+    }
+    const checkedDestination = validateInspectorDestination(input, target.region);
+    if (checkedDestination.keyPrefix.length > 400) {
+      throw new AwsCliError(400, 'INVALID_INPUT', 'The S3 key prefix must be 400 characters or fewer.');
+    }
+    const destination = { ...checkedDestination, keyPrefix: checkedDestination.keyPrefix.replace(/\/+$/, '') };
+    const identity = await this.aws.identity(target.profile, target.region);
+    return this.enqueue(target, identity.account, 'inspector-sbom', null, destination);
+  }
+
+  enqueue(target, account, mode, sbom = null, inspectorDestination = null) {
     const targetKey = keyFor({ ...target, account });
-    const key = `${targetKey}:${mode}${sbom ? `:${sbom.bundleSha256}` : ''}`;
+    const destinationKey = inspectorDestination
+      ? createHash('sha256').update(JSON.stringify(inspectorDestination)).digest('hex') : null;
+    const key = `${targetKey}:${mode}${sbom ? `:${sbom.bundleSha256}` : ''}${destinationKey ? `:${destinationKey}` : ''}`;
     const existing = [...this.jobs.values()].find((item) => item.key === key && ['PENDING', 'IN_PROGRESS'].includes(item.status));
     if (existing) return jobPublic(existing);
     if (this.pending.length >= MAX_PENDING) {
       throw new AwsCliError(429, 'SCAN_QUEUE_FULL', 'The local scan queue is full. Wait for a scan to finish before starting another.');
     }
+    const requestedPrefix = inspectorDestination?.keyPrefix.replace(/\/+$/, '') ?? '';
     const job = {
       id: randomUUID(), key, targetKey, target, account, mode, sbom, status: 'PENDING', phase: 'queued',
       createdAt: new Date().toISOString(), controller: new AbortController(),
+      ...(inspectorDestination ? { inspectorDestination: {
+        ...inspectorDestination,
+        keyPrefix: `${requestedPrefix ? `${requestedPrefix}/` : ''}ecr-sentinel/${randomUUID()}/`,
+      } } : {}),
     };
     this.jobs.set(job.id, job);
     this.pending.push(job);
@@ -582,6 +658,7 @@ export class TrivyScanService {
       job.phase = 'canceled';
       job.completedAt = new Date().toISOString();
       job.sbom = null;
+      job.inspectorDestination = null;
     } else if (job.status === 'IN_PROGRESS') {
       job.controller.abort();
     }
@@ -613,7 +690,8 @@ export class TrivyScanService {
       job.timedOut = true;
       job.controller.abort();
     }, JOB_TIMEOUT_MS);
-    (job.mode === 'sbom' ? this.runSbomJob(job) : this.runJob(job)).then((report) => {
+    (job.mode === 'sbom' ? this.runSbomJob(job)
+      : job.mode === 'inspector-sbom' ? this.runInspectorJob(job) : this.runJob(job)).then((report) => {
       if (job.controller.signal.aborted) throw Object.assign(new Error('Canceled'), { code: 'CANCELED' });
       job.status = 'COMPLETE';
       job.phase = 'complete';
@@ -626,15 +704,15 @@ export class TrivyScanService {
         job.phase = 'failed';
         job.error = {
           code: 'SCAN_DEADLINE',
-          message: job.mode === 'sbom'
-            ? 'The SBOM scan exceeded its 30 minute deadline. Check SBOM size and scanner database access.'
+          message: job.mode !== 'image'
+            ? 'The SBOM workflow exceeded its 30 minute deadline. Check Inspector export, S3 access, and scanner database access.'
             : 'The local scan exceeded its 30 minute deadline. Check image size, VPN, and scanner database access.',
         };
       } else if (job.controller.signal.aborted || error?.code === 'CANCELED') {
         job.status = 'CANCELED';
         job.phase = 'canceled';
       } else {
-        const mapped = job.mode === 'sbom' ? mapSbomError(error, job.phase) : mapTrivyError(error, job.phase);
+        const mapped = job.mode !== 'image' ? mapSbomError(error, job.phase) : mapTrivyError(error, job.phase);
         job.status = 'FAILED';
         job.phase = 'failed';
         job.error = { code: mapped.code, message: mapped.message };
@@ -643,6 +721,7 @@ export class TrivyScanService {
       clearTimeout(deadline);
       job.completedAt = new Date().toISOString();
       job.sbom = null;
+      job.inspectorDestination = null;
       this.active = null;
       this.drain();
     });
@@ -843,6 +922,7 @@ export class TrivyScanService {
         sbomPath, sbomFormat: sbom.format, sbomSha256: sbom.sbomSha256,
         bundleSha256: sbom.bundleSha256,
         generatedAt: sbom.generatedAt, producer: sbom.producer,
+        sbomSource: sbom.source, sbomAssociation: sbom.association,
       });
     } finally {
       await unlink(sbomPath).catch((error) => {
@@ -851,12 +931,110 @@ export class TrivyScanService {
     }
   }
 
+  async runInspectorJob(job) {
+    const { profile, region, repository, digest } = job.target;
+    const signal = job.controller.signal;
+    const checkCanceled = () => {
+      if (signal.aborted) throw Object.assign(new Error('Canceled'), { code: 'CANCELED' });
+    };
+    const scanner = await this.status();
+    if (!scanner.available) throw new AwsCliError(503, scanner.error.code, scanner.error.message);
+    checkCanceled();
+    const identity = await this.aws.identity(profile, region);
+    if (identity.account !== job.account) {
+      throw new AwsCliError(409, 'AWS_ACCOUNT_CHANGED', 'The selected profile now resolves to a different AWS account. Reconnect and start a new scan.');
+    }
+    // DescribeImages reads ECR inventory metadata. It does not fetch manifests or layers.
+    const image = await this.aws.image(profile, region, repository, digest);
+    if (image.imageStatus && image.imageStatus !== 'ACTIVE') {
+      throw new AwsCliError(422, 'IMAGE_ARCHIVED', 'Restore this image in ECR before exporting its Inspector SBOM.');
+    }
+    checkCanceled();
+    const destination = job.inspectorDestination;
+    if (!destination) throw Object.assign(new Error('Canceled'), { code: 'CANCELED' });
+    job.phase = 'requesting-sbom';
+    const { reportId, resourceId } = await this.aws.createInspectorSbomExport(job.target, job.account, destination, signal);
+    checkCanceled();
+    job.phase = 'waiting-for-sbom';
+    const expiresAt = Date.now() + INSPECTOR_EXPORT_TIMEOUT_MS;
+    let exportStatus;
+    while (Date.now() < expiresAt) {
+      checkCanceled();
+      exportStatus = await this.aws.getInspectorSbomExport(job.target, reportId, signal);
+      checkCanceled();
+      if (exportStatus.status !== 'IN_PROGRESS') break;
+      await delay(INSPECTOR_POLL_MS, undefined, { signal });
+    }
+    if (!exportStatus || exportStatus.status === 'IN_PROGRESS') {
+      throw new AwsCliError(504, 'INSPECTOR_EXPORT_TIMEOUT', 'Inspector did not finish the SBOM export within 12 minutes. Check export status in AWS and retry.');
+    }
+    if (exportStatus.status !== 'SUCCEEDED') {
+      const code = exportStatus.errorCode;
+      const message = code === 'NO_FINDINGS_FOUND'
+        ? 'Inspector has no monitored SBOM for this exact image. Check enhanced scanning coverage and retry.'
+        : code === 'INVALID_PERMISSIONS'
+          ? 'Inspector cannot write this SBOM. Check the S3 bucket policy and KMS key policy for Inspector exports.'
+          : code === 'BUCKET_NOT_FOUND' || code === 'INCOMPATIBLE_BUCKET_REGION' || code === 'MALFORMED_KMS_KEY'
+            ? 'Inspector rejected the S3 bucket or KMS key. Check that both are configured for this Region.'
+            : 'Inspector could not export this image SBOM. Check Inspector coverage and export configuration.';
+      throw new AwsCliError(502, 'INSPECTOR_EXPORT_FAILED', message);
+    }
+    if (exportStatus.format !== 'CYCLONEDX_1_4'
+      || exportStatus.s3Destination?.bucketName !== destination.bucketName
+      || exportStatus.s3Destination?.keyPrefix !== destination.keyPrefix
+      || exportStatus.s3Destination?.kmsKeyArn !== destination.kmsKeyArn) {
+      throw new AwsCliError(502, 'INSPECTOR_EXPORT_MISMATCH', 'Inspector returned a different SBOM format or export destination. The object was not opened.');
+    }
+    const filters = exportStatus.filterCriteria;
+    const expected = {
+      accountId: job.account,
+      resourceId,
+      resourceType: 'AWS_ECR_CONTAINER_IMAGE',
+    };
+    if (!filters || Object.entries(expected).some(([name, value]) =>
+      !Array.isArray(filters[name]) || filters[name].length !== 1
+      || filters[name][0]?.comparison !== 'EQUALS' || filters[name][0]?.value !== value)) {
+      throw new AwsCliError(502, 'INSPECTOR_EXPORT_MISMATCH', 'Inspector returned different resource filters. The object was not opened.');
+    }
+    checkCanceled();
+    job.phase = 'retrieving-sbom';
+    const object = await this.aws.listInspectorSbomObject(job.target, destination, signal);
+    const cacheRoot = await this.ensureCache();
+    const exportPath = join(cacheRoot, 'sboms', `${randomUUID()}.cyclonedx.json`);
+    const file = await open(exportPath, 'wx', 0o600);
+    await file.close();
+    try {
+      await this.aws.downloadInspectorSbomObject(job.target, destination, object, exportPath, signal);
+      checkCanceled();
+      const details = await lstat(exportPath);
+      const owner = typeof process.getuid === 'function' ? process.getuid() : details.uid;
+      if (!details.isFile() || details.isSymbolicLink() || details.uid !== owner
+        || (details.mode & 0o077) !== 0 || details.size !== object.size || details.size > MAX_SBOM_BYTES) {
+        throw new AwsCliError(422, 'INSPECTOR_EXPORT_INVALID', 'The downloaded Inspector SBOM changed size or is not a private local file.');
+      }
+      const bytes = await readFile(exportPath);
+      checkCanceled();
+      let sbom;
+      try { sbom = JSON.parse(bytes.toString('utf8')); } catch {
+        throw new AwsCliError(422, 'INSPECTOR_SBOM_INVALID', 'Inspector exported unreadable SBOM JSON.');
+      }
+      job.sbom = validateInspectorSbom(sbom, job.target, job.account);
+    } finally {
+      await unlink(exportPath).catch((error) => {
+        if (error?.code !== 'ENOENT') throw error;
+      });
+    }
+    checkCanceled();
+    return this.runSbomJob(job);
+  }
+
   async dispose() {
     for (const job of this.pending) {
       job.status = 'CANCELED';
       job.phase = 'canceled';
       job.completedAt = new Date().toISOString();
       job.sbom = null;
+      job.inspectorDestination = null;
     }
     this.pending = [];
     this.active?.controller.abort();

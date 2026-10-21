@@ -1,6 +1,6 @@
 # Development and verification
 
-ECR Sentinel is intentionally small: a Node.js ES module server, static browser UI, AWS CLI adapter, Trivy job service, and build-host SBOM helper. There is no frontend build step, framework, database, or remote service controlled by this repository.
+ECR Sentinel is intentionally small: a Node.js ES module server, static browser UI, AWS CLI adapter, Trivy job service, and build-host SBOM helper. Its Inspector path uses AWS-managed Inspector/S3/KMS resources but deploys none of them. There is no frontend build step, framework, or database.
 
 ## Local setup
 
@@ -20,8 +20,8 @@ Use Node.js 20 or newer. The app also needs AWS CLI v2 and Trivy 0.71.1 or newer
 | --- | --- |
 | `server.js` | Loopback server and request gate. |
 | `src/api.js` | Internal JSON routes and body bounds. |
-| `src/aws-cli.js` | Profile, MFA, AWS identity/inventory, credentials. |
-| `src/trivy.js` | Scan queue, Trivy execution, normalization, retention. |
+| `src/aws-cli.js` | Profile, MFA, AWS identity/inventory, Inspector export/S3 retrieval, credentials. |
+| `src/trivy.js` | Scan queue, Inspector SBOM binding, Trivy execution, normalization, retention. |
 | `public/index.html` | Semantic app structure and dialogs. |
 | `public/styles.css` | Visual system and responsive layout. |
 | `public/app.js` | UI state, actions, polling, filtering, CSV export. |
@@ -52,15 +52,15 @@ There is no separate lint, type-check, or build script in `package.json`. `npm a
 
 For UI changes, manually check desktop and mobile widths, keyboard focus, form errors, modal focus return, empty inventory, active scan, failed scan, and long finding names. For AWS changes, test with a disposable account/profile and verify that OTPs, launch tokens, access keys, and session tokens never appear in logs, browser storage other than the launch token, error responses, CSV exports, or child-process arguments.
 
-The automated suite uses simulated AWS/Trivy behavior and a local SBOM fixture. A live role MFA challenge, a private ECR pull scan, and a genuine post-push build-host bundle require authorized environments; tests alone do not validate those integrations.
+The automated suite uses simulated AWS/Trivy behavior and local SBOM fixtures. A live role MFA challenge, Inspector export/S3/KMS route, private ECR pull scan, and genuine post-push build-host bundle require authorized environments; tests alone do not validate those integrations.
 
 ## Change guidelines
 
-- Keep AWS requests tied to a selected named profile, verified caller account, Region, repository, and immutable digest. Do not accept arbitrary registry URLs from an API request.
+- Keep AWS requests tied to a selected named profile, verified caller account, Region, repository, and immutable digest. Do not accept arbitrary registry URLs from an API request. Inspector exports must always use an exact resource ID filter and a unique S3 prefix.
 - Preserve `execFile`/`spawn` argument arrays and avoid shell interpolation. Bound input, process time, output size, queue depth, and file size before adding new workflows.
 - Update both the UI and server validation when adding an input; server validation is authoritative.
-- Keep database download separate from credential-bearing Trivy image analysis. SBOM scanning must not receive AWS credentials.
-- Treat imported SBOM fields as claims until signed provenance is implemented. Do not silently convert an unverified claim into trusted evidence.
+- Keep database download separate from credential-bearing Trivy image analysis. Neither SBOM path may pass AWS credentials to Trivy. Inspector S3 reads must remain bounded and private, and no raw AWS CLI stderr or SBOM content should enter browser errors.
+- Treat imported SBOM fields as claims until signed provenance is implemented. Inspector metadata can bind an export to an image digest but cannot attest package completeness or a missing OS/variant. Do not silently convert a claim into trusted evidence.
 - Keep error messages actionable but free of raw AWS CLI stderr, credential values, and private paths.
 - Add a test for a meaningful new security boundary or failure mode. Avoid tests that merely duplicate implementation details.
 - Update `README.md` and the focused guide for user-visible behavior, permissions, command requirements, or changed limits.

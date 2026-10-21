@@ -44,18 +44,24 @@ On an authorized build host, generate a Sentinel bundle from the exact final ima
 
 The bundle's image association and producer are **claims**, not signed provenance. Only import from a trusted source. SBOM mode cannot identify packages omitted from the bundle. See [the build-host guide](BUILD_HOST_SBOM.md).
 
+### Inspector SBOM → Trivy
+
+Use this when your Mac may read ECR inventory but may not pull image layers and the image is already covered by Amazon Inspector Enhanced Scanning. In the image drawer, choose **Inspector SBOM → Trivy**. Enter the approved S3 export bucket, prefix, and KMS key ARN supplied by your AWS team, then start the job. Sentinel asks Inspector for a CycloneDX SBOM of the selected digest, waits for export, retrieves the JSON from S3, checks the image identity and platform, and asks local Trivy to find known CVEs in the listed components. The Mac reads the SBOM object, not ECR image layers. You need Inspector export, S3 read/list, and KMS decrypt permissions in addition to ECR inventory rights.
+
+The app shows progress for the Inspector request, export wait, SBOM retrieval, and Trivy scan. The S3 object can remain after a local job ends or is canceled; your AWS team should set retention for the export bucket. If Inspector does not monitor the image, or if an index digest differs from the platform's child digest in the SBOM, the app stops with a mismatch/coverage error rather than presenting a report for the wrong target. [Inspector setup and limitations](INSPECTOR_SBOM.md).
+
 One local scan runs at a time, with up to three waiting. You can close the image drawer while a scan runs. **Cancel scan** asks for confirmation. A server restart discards active jobs and in-memory reports.
 
 ## Review and export
 
-The report shows the scanner version, vulnerability database date, selected platform, detected package types, severity counts, affected package and version, available fix, and advisory link when supplied. SBOM reports also show the claimed producer and a normalized SBOM SHA-256.
+The report shows the scanner version, vulnerability database date, selected platform, detected package types, severity counts, affected package and version, available fix, and advisory link when supplied. SBOM reports identify their source and a normalized SBOM SHA-256. A manual bundle's producer is a claim; an Inspector export is associated with the verified Inspector request and SBOM metadata.
 
 - Use **Search findings** and **Filter by severity** to narrow the displayed list. **Show 100 more findings** reveals more of the current report.
 - **Refresh** checks the current server's latest job or report for that profile, account, Region, digest, and platform.
 - **Export report** downloads a CSV from the current in-memory report. It includes the report findings, regardless of the current UI filter.
 - **Switch AWS profile** returns to the connection screen. Verify the account before beginning a new scan.
 
-A report with no findings means Trivy found no *known vulnerabilities in detected packages* at that database date. It is not proof that an image is safe. A report with no detected packages has limited coverage. Offline mode can miss dependencies that require remote resolution, especially some Java packages. Rescan when the image or vulnerability database changes.
+A report with no findings means Trivy found no *known vulnerabilities in detected packages* at that database date. It is not proof that an image is safe. A report with no detected packages has limited coverage. Trivy warns that third-party SBOMs, including Inspector exports, may give less precise results than a Trivy-generated SBOM. Offline mode can miss dependencies that require remote resolution, especially some Java packages. Rescan when the image or vulnerability database changes.
 
 ## Session and data handling
 

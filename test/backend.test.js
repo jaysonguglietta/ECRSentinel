@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter, once } from 'node:events';
 import { AwsCliService } from '../src/aws-cli.js';
-import { TrivyScanService, normalizeTrivyReport, validatePlatform } from '../src/trivy.js';
+import { TrivyScanService, normalizeTrivyReport, validateInspectorSbom, validatePlatform } from '../src/trivy.js';
 import { createAppServer } from '../server.js';
 
 const digest = `sha256:${'a'.repeat(64)}`;
@@ -277,6 +277,20 @@ function sbomBundle(overrides = {}) {
   };
 }
 
+function inspectorSbom(overrides = {}) {
+  return {
+    bomFormat: 'CycloneDX', specVersion: '1.4', version: 1,
+    metadata: { timestamp: '2026-10-21T12:00:00Z', properties: [
+      { name: 'imageId', value: digest },
+      { name: 'architecture', value: 'amd64' },
+      { name: 'accountId', value: account },
+      { name: 'resourceType', value: 'AWS_ECR_CONTAINER_IMAGE' },
+    ] },
+    components: [{ type: 'library', name: 'openssl', version: '3.0.0' }],
+    ...overrides,
+  };
+}
+
 test('Trivy report normalizes CVEs and verifies selected image and architecture', () => {
   const report = normalizeTrivyReport(trivyReport(), context());
   assert.equal(report.findings[0].id, 'CVE-2026-1234');
@@ -408,6 +422,203 @@ test('SBOM import rejects a mismatched target before invoking Trivy', async () =
     }) }), { code: 'SBOM_TARGET_MISMATCH' });
     assert.equal(calls, 0);
   } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('Inspector SBOM requires one exact image, account, resource type, and architecture', () => {
+  const target = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest, platform: 'linux/amd64' };
+  const valid = validateInspectorSbom(inspectorSbom(), target, account);
+  assert.equal(valid.format, 'cyclonedx');
+  assert.equal(valid.source, 'amazon-inspector');
+  assert.equal(valid.association, 'metadata-verified');
+  const replace = (name, value) => inspectorSbom({
+    metadata: { ...inspectorSbom().metadata,
+      properties: inspectorSbom().metadata.properties.map((item) => item.name === name ? { name, value } : item) },
+  });
+  for (const [name, value] of [
+    ['imageId', `sha256:${'b'.repeat(64)}`], ['accountId', '999999999999'],
+    ['resourceType', 'AWS_EC2_INSTANCE'], ['architecture', 'arm64'],
+  ]) {
+    assert.throws(() => validateInspectorSbom(replace(name, value), target, account),
+      { code: 'INSPECTOR_SBOM_TARGET_MISMATCH' });
+  }
+  const duplicate = inspectorSbom({ metadata: { ...inspectorSbom().metadata,
+    properties: [...inspectorSbom().metadata.properties, { name: 'imageId', value: digest }] } });
+  assert.throws(() => validateInspectorSbom(duplicate, target, account), { code: 'INSPECTOR_SBOM_UNBOUND' });
+  assert.throws(() => validateInspectorSbom(inspectorSbom(), { ...target, platform: 'linux/amd64/v3' }, account),
+    { code: 'INSPECTOR_SBOM_PLATFORM_UNVERIFIED' });
+  assert.throws(() => validateInspectorSbom([inspectorSbom(), inspectorSbom()], target, account),
+    { code: 'INSPECTOR_SBOM_INVALID' });
+});
+
+test('AWS Inspector export uses exact filters and bounded single-object S3 retrieval', async () => {
+  const reportId = '11111111-2222-3333-4444-555555555555';
+  const prefix = 'team/ecr-sentinel/test-job/';
+  const destination = { bucketName: 'security-sboms', keyPrefix: prefix,
+    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` };
+  const etag = `"${'a'.repeat(32)}"`;
+  const fake = fakeRunner({
+    'configure list-profiles': 'role\n',
+    'inspector2 create-sbom-export': { reportId },
+    'inspector2 get-sbom-export': { reportId, status: 'SUCCEEDED', format: 'CYCLONEDX_1_4', s3Destination: destination },
+    's3api list-objects-v2': { Contents: [{ Key: `${prefix}${reportId}.json`, Size: 144, ETag: etag }] },
+    's3api get-object': { ContentLength: 144, ETag: etag },
+  });
+  const aws = new AwsCliService({ run: fake.run });
+  const target = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest, platform: 'linux/amd64' };
+  const created = await aws.createInspectorSbomExport(target, account, destination);
+  assert.equal(created.reportId, reportId);
+  const createCall = fake.calls.find((item) => item.args[1] === 'create-sbom-export');
+  const filters = JSON.parse(createCall.args.find((arg) => arg.startsWith('--resource-filter-criteria=')).split('=', 2)[1]);
+  const sentDestination = JSON.parse(createCall.args.find((arg) => arg.startsWith('--s3-destination=')).slice('--s3-destination='.length));
+  assert.deepEqual(sentDestination, destination);
+  assert.deepEqual(filters, {
+    accountId: [{ comparison: 'EQUALS', value: account }],
+    resourceId: [{ comparison: 'EQUALS', value: `arn:aws:ecr:us-east-1:${account}:repository/team/api/${digest}` }],
+    resourceType: [{ comparison: 'EQUALS', value: 'AWS_ECR_CONTAINER_IMAGE' }],
+  });
+  assert.equal(createCall.options.shell, false);
+  const status = await aws.getInspectorSbomExport(target, reportId);
+  assert.equal(status.status, 'SUCCEEDED');
+  assert.equal(status.s3Destination.keyPrefix, sentDestination.keyPrefix);
+  const object = await aws.listInspectorSbomObject(target, destination);
+  await aws.downloadInspectorSbomObject(target, destination, object, '/tmp/inspector-test.json');
+  const listCall = fake.calls.find((item) => item.args[1] === 'list-objects-v2');
+  assert.ok(listCall.args.includes('--max-keys=2'));
+  assert.ok(listCall.args.includes('--no-paginate'));
+  const getCall = fake.calls.find((item) => item.args[1] === 'get-object');
+  assert.ok(getCall.args.includes('--range=bytes=0-16777216'));
+  assert.ok(getCall.args.includes(`--if-match=${etag}`));
+  assert.equal(getCall.options.maxBuffer, 64 * 1024);
+  assert.equal(fake.calls.some((item) => ['batch-get-image', 'get-download-url-for-layer'].includes(item.args[1])), false);
+  await assert.rejects(() => aws.createInspectorSbomExport(target, account,
+    { ...destination, keyPrefix: '../other' }), { code: 'INVALID_INPUT' });
+  fake.run = fakeRunner({
+    'configure list-profiles': 'role\n',
+    's3api list-objects-v2': { Contents: [
+      { Key: `${prefix}one.json`, Size: 1, ETag: etag },
+      { Key: `${prefix}two.json`, Size: 1, ETag: etag },
+    ] },
+  }).run;
+  await assert.rejects(() => new AwsCliService({ run: fake.run }).listInspectorSbomObject(target, destination),
+    { code: 'INSPECTOR_EXPORT_AMBIGUOUS' });
+});
+
+test('Inspector permission failures name the required action without exposing AWS stderr', async () => {
+  const target = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest, platform: 'linux/amd64' };
+  const reportId = '11111111-2222-3333-4444-555555555555';
+  const destination = { bucketName: 'security-sboms', keyPrefix: 'team/ecr-sentinel/test-job/',
+    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` };
+  const object = { key: `${destination.keyPrefix}${reportId}.json`, etag: `"${'a'.repeat(32)}"`, size: 144 };
+  const cases = [
+    ['inspector2 create-sbom-export', (aws) => aws.createInspectorSbomExport(target, account, destination),
+      'INSPECTOR_CREATE_DENIED', 'inspector2:CreateSbomExport'],
+    ['inspector2 get-sbom-export', (aws) => aws.getInspectorSbomExport(target, reportId),
+      'INSPECTOR_STATUS_DENIED', 'inspector2:GetSbomExport'],
+    ['s3api list-objects-v2', (aws) => aws.listInspectorSbomObject(target, destination),
+      'INSPECTOR_S3_LIST_DENIED', 's3:ListBucket'],
+    ['s3api get-object', (aws) => aws.downloadInspectorSbomObject(target, destination, object, '/tmp/inspector-test.json'),
+      'INSPECTOR_S3_READ_DENIED', 'kms:Decrypt'],
+  ];
+  for (const [operation, invoke, code, action] of cases) {
+    const denied = new Error('AWS command failed');
+    denied.stderr = 'AccessDenied: sensitive account context from AWS';
+    const fake = fakeRunner({ 'configure list-profiles': 'role\n', [operation]: denied });
+    const aws = new AwsCliService({ run: fake.run });
+    await assert.rejects(() => invoke(aws), (error) => error.code === code && error.status === 403
+      && error.message.includes(action) && !error.message.includes('sensitive account context'));
+  }
+});
+
+test('Inspector export flows into credential-free Trivy SBOM scan and deletes local export', async () => {
+  const calls = [];
+  let sbomPath;
+  const fixture = await scanFixture(async (_cmd, args, options) => {
+    calls.push({ args, options });
+    if (args[0] === 'version') return { stdout: '{"Version":"0.76.0"}' };
+    if (args.includes('--download-db-only')) return { stdout: '' };
+    if (args[0] === 'sbom') {
+      sbomPath = args.at(-1);
+      return { stdout: JSON.stringify({ SchemaVersion: 2, ArtifactName: sbomPath,
+        ArtifactType: 'cyclonedx', Results: trivyReport().Results }) };
+    }
+    throw new Error('unexpected trivy invocation');
+  });
+  const target = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest, platform: 'linux/amd64' };
+  const document = JSON.stringify(inspectorSbom());
+  const destinations = [];
+  fixture.aws.createInspectorSbomExport = async (_target, _account, destination) => {
+    destinations.push(destination);
+    return { reportId: '11111111-2222-3333-4444-555555555555',
+      resourceId: `arn:aws:ecr:us-east-1:${account}:repository/team/api/${digest}` };
+  };
+  fixture.aws.getInspectorSbomExport = async () => ({
+    status: 'SUCCEEDED', format: 'CYCLONEDX_1_4', s3Destination: destinations[0],
+    filterCriteria: {
+      accountId: [{ comparison: 'EQUALS', value: account }],
+      resourceId: [{ comparison: 'EQUALS', value: `arn:aws:ecr:us-east-1:${account}:repository/team/api/${digest}` }],
+      resourceType: [{ comparison: 'EQUALS', value: 'AWS_ECR_CONTAINER_IMAGE' }],
+    },
+  });
+  fixture.aws.listInspectorSbomObject = async () => ({ key: `${destinations[0].keyPrefix}report.json`,
+    etag: `"${'a'.repeat(32)}"`, size: Buffer.byteLength(document) });
+  let exportedPath;
+  fixture.aws.downloadInspectorSbomObject = async (_target, _destination, _object, path) => {
+    exportedPath = path;
+    await writeFile(path, document);
+  };
+  try {
+    const started = await fixture.scans.startInspector({ ...target, bucketName: 'security-sboms', keyPrefix: 'team/',
+      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` });
+    const completed = await waitForTerminal(fixture.scans, started.id);
+    assert.equal(completed.status, 'COMPLETE');
+    assert.equal(completed.mode, 'inspector-sbom');
+    assert.equal(completed.report.scanMode, 'sbom');
+    assert.equal(completed.report.provenance.source, 'amazon-inspector');
+    assert.equal(completed.report.provenance.association, 'metadata-verified');
+    assert.equal(completed.report.findings[0].id, 'CVE-2026-1234');
+    assert.match(destinations[0].keyPrefix, /^team\/ecr-sentinel\/[a-f0-9-]{36}\/$/);
+    assert.ok(calls.every((call) => call.options.env.AWS_ACCESS_KEY_ID === undefined));
+    assert.ok(calls.every((call) => !call.args.includes('--image-src=remote')));
+    await assert.rejects(() => access(exportedPath), { code: 'ENOENT' });
+    await assert.rejects(() => access(sbomPath), { code: 'ENOENT' });
+    await assert.rejects(() => fixture.scans.startInspector({ ...target,
+      bucketName: 'security-sboms', keyPrefix: 'a'.repeat(401),
+      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` }),
+    { code: 'INVALID_INPUT' });
+  } finally {
+    await fixture.scans.dispose();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test('Inspector export without exact returned filters is rejected before S3 access', async () => {
+  const fixture = await scanFixture(async (_cmd, args) => {
+    if (args[0] === 'version') return { stdout: '{"Version":"0.76.0"}' };
+    throw new Error('unexpected scan invocation');
+  });
+  let destination;
+  let listed = false;
+  fixture.aws.createInspectorSbomExport = async (_target, _account, selected) => {
+    destination = selected;
+    return { reportId: '11111111-2222-3333-4444-555555555555',
+      resourceId: `arn:aws:ecr:us-east-1:${account}:repository/team/api/${digest}` };
+  };
+  fixture.aws.getInspectorSbomExport = async () => ({
+    status: 'SUCCEEDED', format: 'CYCLONEDX_1_4', s3Destination: destination,
+  });
+  fixture.aws.listInspectorSbomObject = async () => { listed = true; throw new Error('must not list'); };
+  try {
+    const started = await fixture.scans.startInspector({ profile: 'role', region: 'us-east-1',
+      repository: 'team/api', digest, platform: 'linux/amd64', bucketName: 'security-sboms',
+      kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` });
+    const completed = await waitForTerminal(fixture.scans, started.id);
+    assert.equal(completed.status, 'FAILED');
+    assert.equal(completed.error.code, 'INSPECTOR_EXPORT_MISMATCH');
+    assert.equal(listed, false);
+  } finally {
+    await fixture.scans.dispose();
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });
@@ -674,6 +885,35 @@ test('SBOM API accepts the dedicated upload route and rejects concurrent uploads
     method: 'POST', headers: { ...headers, 'content-length': String(20 * 1024 * 1024 + 1) },
   });
   assert.equal(oversized.status, 413);
+});
+
+test('Inspector scan API accepts a protected JSON request and returns an existing scan job', async () => {
+  const calls = [];
+  const scans = {
+    startInspector: async (body) => {
+      calls.push(body);
+      return { id: '11111111-2222-3333-4444-555555555555', status: 'PENDING', mode: 'inspector-sbom' };
+    },
+    dispose: async () => {},
+  };
+  const { server, token } = createAppServer({ aws: {}, scans, token: 'test-token' });
+  server.address = () => ({ port: 4173 });
+  const body = { profile: 'role', region: 'us-east-1', repository: 'team/api', digest,
+    platform: 'linux/amd64', bucketName: 'security-sboms',
+    kmsKeyArn: `arn:aws:kms:us-east-1:${account}:key/12345678-1234-1234-1234-123456789abc` };
+  const headers = { 'x-ecr-sentinel-token': token, 'content-type': 'application/json' };
+  const denied = await simulatedRequest(server, '/api/scans/inspector', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal(denied.status, 403);
+  assert.equal(calls.length, 0);
+  const response = await simulatedRequest(server, '/api/scans/inspector', {
+    method: 'POST', headers, body: JSON.stringify(body),
+  });
+  assert.equal(response.status, 202);
+  assert.equal(JSON.parse(response.body).mode, 'inspector-sbom');
+  assert.deepEqual(calls, [body]);
+  assert.equal((await simulatedRequest(server, '/api/scans/inspector', { headers })).status, 405);
 });
 
 test('MFA API accepts a code only in a protected POST body and returns no secrets', async () => {

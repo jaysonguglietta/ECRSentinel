@@ -1,6 +1,6 @@
 # AWS profiles, permissions, and network access
 
-Sentinel runs under one named AWS CLI profile on a Mac. It asks AWS STS for the caller identity, lists ECR repositories and image metadata, and, only for a direct image scan, lets Trivy retrieve the selected image digest. The application does not call ECR managed-scanning APIs.
+Sentinel runs under one named AWS CLI profile on a Mac. It asks AWS STS for the caller identity, lists ECR repositories and image metadata, and, only for a direct image scan, lets Trivy retrieve the selected image digest. The Inspector SBOM option calls Inspector's export API and reads the result from an approved S3 bucket. It does not call ECR basic-scanning APIs.
 
 ## Profile setup
 
@@ -24,7 +24,7 @@ For SSO, run `aws sso login --profile YOUR_SSO_PROFILE`. For a role-profile Term
 
 Apply the following to the **assumed role** or other selected principal, replacing `REGION`, `ACCOUNT_ID`, and the repository scope. The source principal separately needs `sts:AssumeRole` permission for the exact role ARN, and the role trust policy must admit it. [AWS's ECR authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ecr.html) identifies which ECR actions can be scoped to repositories.
 
-### Inventory and SBOM-only use
+### Inventory and manual SBOM import
 
 This is sufficient for Sentinel's ECR metadata calls and SBOM checks, assuming the role can be assumed and the network can reach STS and ECR:
 
@@ -76,7 +76,11 @@ Add these permissions to the selected principal if policy allows image-layer acc
 
 This supplements the inventory policy. Replace the repository wildcard with approved repository paths where possible. [AWS documents the registry token and repository-policy behavior](https://docs.aws.amazon.com/AmazonECR/latest/userguide/repository-policies.html). A successful repository listing does **not** imply the ability to scan layers. If the profile may list but not pull, choose the SBOM workflow; do not weaken a read restriction just to make the scan button work.
 
-The Mac profile does not need `ecr:StartImageScan`, `ecr:DescribeImageScanFindings`, Amazon Inspector permissions, or image-push permissions. The build host that generates an SBOM uses its **own** approved image access and transfer permissions; no SBOM storage service is built into Sentinel.
+The Mac profile does not need `ecr:StartImageScan`, `ecr:DescribeImageScanFindings`, or image-push permissions. Manual SBOM import needs no Inspector permission; the build host that generates a bundle uses its **own** approved image access and transfer route.
+
+### Inspector SBOM export and local Trivy
+
+The selected principal needs `inspector2:CreateSbomExport` and `inspector2:GetSbomExport`, plus `s3:ListBucket` and `s3:GetObject` restricted to the approved export prefix and `kms:Decrypt` on the export key. The Inspector service needs permission to write and encrypt in that bucket and KMS key. The bucket and customer-managed symmetric key must be in the selected image's Region. The image must already be monitored through Inspector Enhanced Scanning. None of these actions grants the Mac access to ECR image layers. See the complete [Inspector setup and caller policy](INSPECTOR_SBOM.md) and [AWS's export guide](https://docs.aws.amazon.com/inspector/latest/user/sbom-export.html).
 
 ## Network checklist
 
@@ -84,7 +88,8 @@ The Mac profile does not need `ecr:StartImageScan`, `ecr:DescribeImageScanFindin
 | --- | --- |
 | Connection and inventory | AWS STS and ECR API endpoints for the selected Region, using the organization's VPN/DNS route where required. |
 | Direct image scan | The above, plus the ECR registry endpoint and the image-layer download route through S3. |
-| SBOM scan on the Mac | STS and ECR API for identity and digest verification; no ECR image-layer endpoint. |
+| Manual SBOM scan on the Mac | STS and ECR API for identity and digest verification; no ECR image-layer endpoint. |
+| Inspector SBOM → Trivy | STS, ECR API, Inspector API, and the approved S3 export bucket (plus AWS KMS through the service). No ECR registry or image-layer endpoint on the Mac. |
 | First scan and database refresh | Trivy database registries, including its default `mirror.gcr.io` and `ghcr.io` sources in the current app configuration. |
 
 An ECR API call can work while an image pull fails because the registry or S3 layer route is blocked. [AWS documents ECR endpoint and S3 requirements](https://docs.aws.amazon.com/AmazonECR/latest/userguide/vpc-endpoints.html). Sentinel currently does not expose an internal Trivy database mirror setting; a restricted or air-gapped network requires an application change.
@@ -95,4 +100,5 @@ An ECR API call can work while an image pull fails because the registry or S3 la
 2. Confirm the role source can assume the role and its trust policy permits that identity, including MFA conditions.
 3. If **Connect to registry** succeeds but the list is empty or denied, check `ecr:DescribeRepositories` and `ecr:DescribeImages` for the relevant repository ARNs, plus organization-level denies.
 4. If only a direct scan fails, check `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, repository policies, and network access to ECR/S3.
-5. If an SBOM check fails, verify that the bundle refers to the same account, Region, repository, digest, and platform selected in the app. See [troubleshooting](TROUBLESHOOTING.md).
+5. If a manual SBOM check fails, verify that the bundle refers to the same account, Region, repository, digest, and platform selected in the app.
+6. If an Inspector SBOM check fails, confirm Inspector coverage, the exact digest, export API permissions, S3/KMS service policy, and caller read/decrypt access. See [Inspector setup](INSPECTOR_SBOM.md) and [troubleshooting](TROUBLESHOOTING.md).

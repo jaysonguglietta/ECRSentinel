@@ -73,7 +73,7 @@
             <div>
               <div class="eyebrow">CONTAINER SECURITY</div>
               <h1 id="pageTitle">Your ECR registry, in focus</h1>
-              <p id="pageSubtitle">Connect an AWS profile to scan image layers or check a matching build-host SBOM with Trivy.</p>
+              <p id="pageSubtitle">Connect an AWS profile to scan image layers, request an Inspector SBOM, or check a build-host SBOM with Trivy.</p>
             </div>
             <div class="heading-actions" id="headingActions" hidden>
               <button class="button button-secondary" id="refreshButton" type="button"><svg><use href="#i-refresh"></use></svg> Refresh</button>
@@ -91,7 +91,7 @@
             <div class="setup-body">
               <div class="card-eyebrow"><span class="step-dot">01</span> CONNECT TO AWS</div>
               <h2 id="setupTitle">Start with your configured profile</h2>
-              <p>Sentinel uses your local AWS CLI session to find private ECR images. Trivy can scan image layers when pull access is allowed, or check a matching SBOM bundle generated on an authorized build host.</p>
+              <p>Sentinel uses your local AWS CLI session to find private ECR images. Trivy can scan image layers when pull access is allowed, or check an Inspector or build-host SBOM without pulling the image to this Mac.</p>
               <form id="connectionForm" novalidate>
                 <div class="form-grid">
                   <label class="field"><span>AWS profile</span><select id="profileSelect" required><option value="">Loading profiles…</option></select><small id="profileHelp">Profiles come from your AWS CLI configuration.</small></label>
@@ -127,7 +127,7 @@
 
           <section class="overview-guidance" id="overviewGuidance" aria-label="How it works">
             <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-box"></use></svg></div><h3>Browse images</h3><p>Choose a repository, then inspect the exact digest behind each image tag.</p></div>
-            <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-scan"></use></svg></div><h3>Choose scan input</h3><p>Scan image layers with pull access, or import a matching build-host SBOM to check its recorded packages.</p></div>
+            <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-scan"></use></svg></div><h3>Choose scan input</h3><p>Scan image layers with pull access, request an Inspector SBOM, or import a matching build-host bundle.</p></div>
             <div class="guidance-card"><div class="guidance-icon"><svg><use href="#i-clock"></use></svg></div><h3>Review the evidence</h3><p>See affected packages, available fixes, scan time, platform, and scanner version.</p></div>
           </section>
 
@@ -140,7 +140,7 @@
             </div>
 
             <section class="content-card" id="repoOverview" aria-labelledby="overviewTitle">
-              <div class="content-card-header"><div><div class="card-eyebrow">REGISTRY OVERVIEW</div><h2 id="overviewTitle">Select a repository</h2><p>Choose an image digest to scan its layers or check a matching SBOM bundle.</p></div><div class="overview-deco"><svg><use href="#i-layers"></use></svg></div></div>
+              <div class="content-card-header"><div><div class="card-eyebrow">REGISTRY OVERVIEW</div><h2 id="overviewTitle">Select a repository</h2><p>Choose an image digest to scan its layers or check an Inspector or build-host SBOM.</p></div><div class="overview-deco"><svg><use href="#i-layers"></use></svg></div></div>
               <div class="repository-grid" id="repositoryGrid"></div>
               <div class="empty-state" id="repositoriesEmpty" hidden><div class="empty-icon"><svg><use href="#i-box"></use></svg></div><h3>No repositories found</h3><p>This account and Region have no private ECR repositories you can view.</p></div>
             </section>
@@ -163,9 +163,27 @@
       <div class="drawer-content">
         <div class="image-identity"><span class="identity-label">IMAGE DIGEST</span><code id="drawerDigest"></code><div class="drawer-tags" id="drawerTags"></div></div>
         <div class="platform-row"><label class="field platform-field"><span>Image platform</span><select id="platformSelect"><option value="linux/amd64">linux/amd64</option><option value="linux/arm64">linux/arm64</option></select><small>Scan results apply to this platform only.</small></label></div>
+        <section class="inspector-workflow" id="inspectorWorkflow" aria-labelledby="inspectorWorkflowTitle">
+          <div class="inspector-workflow-heading">
+            <div><span class="inspector-eyebrow">NO IMAGE PULL ON THIS MAC</span><h3 id="inspectorWorkflowTitle">Inspector SBOM → Trivy CVEs</h3></div>
+            <svg aria-hidden="true"><use href="#i-shield"></use></svg>
+          </div>
+          <p class="inspector-intro">For images already monitored by <strong>Amazon Inspector Enhanced Scanning</strong>, request a CycloneDX SBOM in your approved S3 bucket. Sentinel downloads the SBOM, verifies its image metadata, then runs Trivy locally against the listed packages. Inspector's managed vulnerability scanning is already active for monitored images.</p>
+          <ol class="inspector-steps"><li><span>1</span><div><strong>Export SBOM</strong><small>Inspector → encrypted S3</small></div></li><li><span>2</span><div><strong>Check CVEs</strong><small>Trivy on this Mac</small></div></li></ol>
+          <form id="inspectorExportForm" novalidate>
+            <div class="inspector-fields">
+              <label class="field"><span>S3 bucket <span class="required-mark">*</span></span><input id="inspectorBucket" name="bucketName" type="text" maxlength="63" autocomplete="off" spellcheck="false" placeholder="approved-sbom-exports" required aria-describedby="inspectorBucketHelp inspectorError"><small id="inspectorBucketHelp">Existing bucket that allows Inspector to write exports and this profile to read them.</small></label>
+              <label class="field"><span>KMS key ARN <span class="required-mark">*</span></span><input id="inspectorKmsArn" name="kmsKeyArn" type="text" maxlength="256" autocomplete="off" spellcheck="false" placeholder="arn:aws:kms:us-east-1:…:key/…" required aria-describedby="inspectorKmsHelp inspectorError"><small id="inspectorKmsHelp">Key configured for Inspector exports in this Region.</small></label>
+              <label class="field inspector-prefix-field"><span>S3 key prefix</span><input id="inspectorPrefix" name="keyPrefix" type="text" maxlength="400" autocomplete="off" spellcheck="false" placeholder="ecr-sentinel/" aria-describedby="inspectorPrefixHelp inspectorError"><small id="inspectorPrefixHelp">Optional folder. Sentinel adds a unique job folder; Inspector writes the SBOM inside it.</small></label>
+            </div>
+            <p class="form-error inspector-error" id="inspectorError" role="alert" tabindex="-1" hidden></p>
+            <div class="inspector-workflow-actions"><button class="button button-primary" id="startInspectorButton" type="submit" aria-describedby="inspectorActionHint" disabled><svg><use href="#i-scan"></use></svg> Export SBOM and check CVEs</button><span id="inspectorActionHint">Only the SBOM is downloaded to this Mac.</span></div>
+          </form>
+          <details class="inspector-requirements"><summary>Access and export requirements</summary><p>The image must be active and monitored by Inspector Enhanced Scanning. The selected AWS profile needs permission to request and check an Inspector SBOM export and read its encrypted S3 object. The bucket and KMS key must allow Inspector to write the export. Sentinel never asks this profile to pull ECR image layers for this workflow.</p></details>
+        </section>
         <p class="form-error sbom-import-error" id="sbomImportError" role="alert" tabindex="-1" hidden></p>
         <div class="scan-status-card" id="scanStatusCard" role="status" aria-live="polite"><div class="status-icon"><svg><use href="#i-info"></use></svg></div><div><strong id="scanStatusTitle">Checking local report</strong><p id="scanStatusDescription">Looking for a previous Trivy scan of this digest and platform.</p><span id="scanTimestamp"></span><button class="button button-secondary button-small scan-recovery-action" id="scanSwitchProfileButton" type="button" hidden>Switch AWS profile</button></div></div>
-        <dl class="scan-provenance" id="scanProvenance" hidden><div><dt>Scanner</dt><dd id="reportScanner">—</dd></div><div><dt>Database updated</dt><dd id="reportDbDate">—</dd></div><div><dt id="reportImageLabel">Image</dt><dd id="reportImage">—</dd></div><div><dt>Coverage</dt><dd id="reportCoverage">—</dd></div><div id="reportSbomProducerRow" hidden><dt>SBOM producer claim</dt><dd id="reportSbomProducer">—</dd></div><div id="reportSbomHashRow" hidden><dt>Normalized SBOM SHA-256</dt><dd id="reportSbomHash">—</dd></div></dl>
+        <dl class="scan-provenance" id="scanProvenance" hidden><div><dt>Scanner</dt><dd id="reportScanner">—</dd></div><div><dt>Database updated</dt><dd id="reportDbDate">—</dd></div><div><dt id="reportImageLabel">Image</dt><dd id="reportImage">—</dd></div><div><dt>Coverage</dt><dd id="reportCoverage">—</dd></div><div id="reportSbomProducerRow" hidden><dt id="reportSbomProducerLabel">SBOM producer claim</dt><dd id="reportSbomProducer">—</dd></div><div id="reportSbomHashRow" hidden><dt>Normalized SBOM SHA-256</dt><dd id="reportSbomHash">—</dd></div></dl>
         <p class="sbom-association-note" id="reportSbomAssociation" hidden>SBOM producer and image association are claims in the imported file. They have not been cryptographically verified.</p>
         <p class="coverage-note" id="reportCoverageNote" hidden></p>
         <p class="report-retention" id="reportRetention" hidden>Reports are held in limited memory while the app runs. Older reports may be evicted and all are cleared on server restart. Export the CSV to retain one.</p>
@@ -178,7 +196,7 @@
           <button class="button button-secondary load-more-findings" id="loadMoreFindings" type="button" hidden>Show 100 more findings <svg><use href="#i-arrow"></use></svg></button>
         </div>
       </div>
-      <div class="drawer-footer"><span id="drawerScanHint">Scan image layers with Trivy or import an SBOM bundle from an authorized build host.</span><small class="sbom-helper-hint">No bundle yet? Run <code>scripts/generate-sbom-bundle.mjs</code> on an authorized build host after push. See the README for usage.</small><div class="drawer-footer-actions"><button class="button button-secondary" id="cancelRunningScanButton" type="button" hidden>Cancel scan</button><button class="button button-secondary" id="importSbomButton" type="button" disabled>Import SBOM bundle</button><input id="sbomFileInput" class="sr-only" type="file" accept=".json,application/json" aria-label="Choose an SBOM bundle JSON file" tabindex="-1"><button class="button button-primary" id="startScanButton" type="button" disabled><svg><use href="#i-scan"></use></svg> Scan image with Trivy</button></div></div>
+      <div class="drawer-footer"><span id="drawerScanHint">Request an Inspector SBOM above, scan image layers with Trivy, or import a build-host SBOM bundle.</span><small class="sbom-helper-hint">No Inspector export? Run <code>scripts/generate-sbom-bundle.mjs</code> on an authorized build host after push. See the README for usage.</small><div class="drawer-footer-actions"><button class="button button-secondary" id="cancelRunningScanButton" type="button" hidden>Cancel scan</button><button class="button button-secondary" id="importSbomButton" type="button" disabled>Import build-host SBOM</button><input id="sbomFileInput" class="sr-only" type="file" accept=".json,application/json" aria-label="Choose a build-host SBOM bundle JSON file" tabindex="-1"><button class="button button-primary" id="startScanButton" type="button" disabled><svg><use href="#i-scan"></use></svg> Scan image with Trivy</button></div></div>
     </aside>
 
     <div class="modal-backdrop" id="confirmBackdrop" hidden></div>

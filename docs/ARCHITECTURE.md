@@ -1,6 +1,6 @@
 # Architecture and local API
 
-ECR Sentinel is a local, single-user Node.js application with a browser UI. The Node server binds to `127.0.0.1` and serves static files plus an internal JSON API. AWS CLI handles inventory and direct image credentials. The AWS SDK credential provider handles supported in-app role MFA. Trivy performs vulnerability checks on the Mac. An optional build-host helper produces an SBOM from a locally available final Docker image.
+ECR Sentinel is a local, single-user Node.js application with a browser UI. The Node server binds to `127.0.0.1` and serves static files plus an internal JSON API. AWS CLI handles inventory, Inspector SBOM exports, S3 retrieval, and direct image credentials. The AWS SDK credential provider handles supported in-app role MFA. Trivy performs vulnerability checks on the Mac. An optional build-host helper produces an SBOM from a locally available final Docker image.
 
 ## Component map
 
@@ -9,6 +9,9 @@ flowchart LR
   B[Browser UI] -->|launch token + JSON| N[Node loopback server]
   N -->|AWS SDK role MFA| S[STS]
   N -->|AWS CLI identity and metadata| A[STS and ECR API]
+  N -->|exact image SBOM export + status| I[Amazon Inspector]
+  I -->|encrypted CycloneDX JSON| S3[Approved S3 bucket]
+  S3 -->|bounded SBOM read via AWS CLI| N
   N -->|direct image job, temporary credentials| T[Local Trivy]
   T -->|selected ECR digest and layers| E[ECR registry and layer storage]
   T -->|database update without AWS credentials| D[Trivy database registries]
@@ -20,8 +23,8 @@ flowchart LR
 | --- | --- |
 | `server.js` | Loopback HTTP server, launch token, Host/Origin checks, static-file restrictions, security headers. |
 | `src/api.js` | Internal route dispatch, JSON limits, uniform error responses. |
-| `src/aws-cli.js` | Profile discovery, authentication method detection, SDK role MFA, AWS CLI calls, target validation, credential export. |
-| `src/trivy.js` | Scanner preflight, queue, database preparation, direct and SBOM scan execution, report normalization and retention. |
+| `src/aws-cli.js` | Profile discovery, authentication method detection, SDK role MFA, AWS CLI calls, Inspector destination validation, export/status, bounded S3 retrieval, credential export. |
+| `src/trivy.js` | Scanner preflight, queue, database preparation, direct and SBOM scan execution, Inspector export orchestration and SBOM identity checks, report normalization and retention. |
 | `public/index.html`, `public/styles.css`, `public/app.js` | Accessible browser UI, connection flow, inventory, scan actions, findings, CSV export. |
 | `public/auth-guide.js` | Profile-specific sign-in instructions. |
 | `scripts/generate-sbom-bundle.mjs` | Build-host helper that binds a local Docker image to an ECR digest/platform and writes a private bundle. |
@@ -32,9 +35,11 @@ The app has no hosted backend, application user database, account signup, multi-
 
 1. **Browser to local server.** The server generates a 256-bit random token per run and prints it in the launch URL fragment. The browser moves it into tab session storage and sends it in `X-ECR-Sentinel-Token` on API requests. Static assets do not contain the token. API requests also pass Host and Origin checks; CORS is not enabled. Anyone holding the launch URL while the server runs can use the app as that local OS user.
 2. **Local server to AWS.** Named profiles are taken from AWS CLI configuration. For a supported MFA role, the one-time code is handed to the AWS SDK provider and temporary credentials remain in server memory. Other profiles use AWS CLI's established credential chain/cache. Calls use fixed command arguments through `execFile`; the shell is not used.
-3. **Local server to Trivy.** Trivy is a child process. Its database update runs without AWS credentials. A direct image scan receives credentials in its child environment to fetch only the selected ECR image by digest. An SBOM scan receives no AWS credentials and reads a temporary private file.
-4. **Build host to Mac.** An imported SBOM is untrusted input even if its metadata matches the selected ECR digest. The importer validates shape, size, account, Region, repository, digest, platform, and optional Trivy RepoDigest property; it does not verify a signature or attest package completeness.
-5. **Third-party content.** ECR metadata, image layers, SBOM JSON, Trivy output, and advisory URLs may be attacker controlled. The UI inserts text as text, accepts only HTTPS advisory links, and protects exported CSV cells against formula interpretation.
+3. **Local server to Inspector and S3.** The request uses an exact ECR image resource ID, account, and resource type filter, then stores Inspector's export in an approved S3 bucket under a random per-job prefix. The server checks export status/destination and reads one bounded object from that prefix. S3/KMS permissions are controlled by the AWS team. The export remains in S3 after the local job ends; the app does not delete it.
+4. **Local server to Trivy.** Trivy is a child process. Its database update runs without AWS credentials. A direct image scan receives credentials in its child environment to fetch only the selected ECR image by digest. Both SBOM scan paths pass no AWS credentials and read a temporary private file.
+5. **Build host to Mac.** An imported SBOM is untrusted input even if its metadata matches the selected ECR digest. The importer validates shape, size, account, Region, repository, digest, platform, and optional Trivy RepoDigest property; it does not verify a signature or attest package completeness.
+6. **Inspector SBOM to Mac.** The Inspector export is checked for CycloneDX 1.4 format, one account, ECR resource type, image digest, and architecture. Inspector's published SBOM metadata may lack repository, Region, OS, and variant; those limits remain explicit. The checked metadata is not an attestation of package completeness.
+7. **Third-party content.** ECR metadata, image layers, SBOM JSON, Trivy output, and advisory URLs may be attacker controlled. The UI inserts text as text, accepts only HTTPS advisory links, and protects exported CSV cells against formula interpretation.
 
 See the [security audit](../SECURITY_AUDIT.md) for residual risks and tests.
 
@@ -63,6 +68,7 @@ The API is for the included browser UI and is not versioned as an external integ
 | GET | `/api/scans/latest` | `profile`, `region`, `repository`, `digest`, `platform` | Latest matching report and job, if still retained. |
 | POST | `/api/scans` | JSON target fields above | HTTP 202 and queued or active direct-image job. |
 | POST | `/api/scans/sbom` | JSON target fields and `bundle` | HTTP 202 and queued or active SBOM job. |
+| POST | `/api/scans/inspector` | JSON target fields, `bucketName`, `kmsKeyArn`, optional `keyPrefix` | HTTP 202 and queued or active Inspector export → local Trivy SBOM job. |
 | GET | `/api/scans/:id` | UUID job ID | Current status, phase, timestamps, error, and completed report if retained. |
 | DELETE | `/api/scans/:id` | UUID job ID | Cancellation request or final job state. |
 
@@ -84,9 +90,9 @@ The browser handles token storage and requests. External scripts should not extr
 
 ## Job lifecycle and limits
 
-Jobs move through `PENDING`, `IN_PROGRESS`, then `COMPLETE`, `FAILED`, or `CANCELED`. Phases include preflight, database update, scan, and report processing. One job runs at a time and up to three may wait. Duplicate active requests for the same target and mode reuse the existing job. Each Trivy scan process has a 15-minute limit; the overall job deadline is 30 minutes. Direct image analysis is capped at 4 GB, report output at 64 MiB, and normalized findings at 5,000.
+Jobs move through `PENDING`, `IN_PROGRESS`, then `COMPLETE`, `FAILED`, or `CANCELED`. Phases include preflight, database update, scan, and report processing. Inspector jobs also request, wait for, and retrieve the export. One job runs at a time and up to three may wait. Duplicate active requests for the same target, mode, and destination reuse the existing job. Each Trivy scan process has a 15-minute limit; Inspector export wait is capped at 12 minutes and the overall job deadline is 30 minutes. Direct image analysis is capped at 4 GB, imported and Inspector SBOMs at 16 MiB, report output at 64 MiB, and normalized findings at 5,000. Canceling a job stops local work; AWS may still finish an export already requested.
 
-The first scan on each server run updates Trivy's vulnerability database; another update is attempted after six hours. Java database download may occur when a scan needs it. Reports are normalized into a common schema with scan mode, account, digest, platform, database timestamp, coverage, severity counts, findings, and, for SBOM scans, bundle provenance claims.
+The first scan on each server run updates Trivy's vulnerability database; another update is attempted after six hours. Java database download may occur when a scan needs it. Reports are normalized into a common schema with scan mode, account, digest, platform, database timestamp, coverage, severity counts, findings, and SBOM provenance. Manual bundles carry producer claims; Inspector reports identify metadata-verified Inspector exports.
 
 The server keeps at most 40 recent job records and ten completed reports **in memory**. Reports disappear on server restart. Imported SBOM bytes are held while queued, written to a mode-`0600` temporary file for Trivy, and removed after normal completion or cancellation. Trivy database and analysis cache persist in `ecr-sentinel-trivy-cache` under the user's operating-system temporary directory. Hard kills may leave a temporary SBOM file; startup cache initialization removes matching files older than one hour. Exported CSV is written only when the operator requests it.
 

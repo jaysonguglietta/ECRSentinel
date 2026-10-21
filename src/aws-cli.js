@@ -14,6 +14,8 @@ const ROLE_ARN_RE = /^arn:(aws|aws-us-gov|aws-cn):iam::(\d{12}):role\/([A-Za-z0-
 const MFA_ARN_RE = /^arn:(aws|aws-us-gov|aws-cn):iam::\d{12}:mfa\/[A-Za-z0-9+=,.@_/-]{1,256}$/;
 const MFA_CODE_RE = /^[0-9]{6}$/;
 const MFA_SESSION_MARGIN_MS = 60_000;
+const INSPECTOR_REPORT_ID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const INSPECTOR_MAX_SBOM_BYTES = 16 * 1024 * 1024;
 
 export class AwsCliError extends Error {
   constructor(status, code, message) {
@@ -79,13 +81,17 @@ export function mapCliError(error) {
     return new AwsCliError(401, 'AWS_CREDENTIALS', 'AWS credentials are unavailable or invalid for this profile. Check your CLI configuration.');
   }
   if (/AccessDenied|UnauthorizedOperation|not authorized/i.test(message)) {
-    return new AwsCliError(403, 'AWS_ACCESS_DENIED', 'The selected AWS profile lacks permission for this ECR action.');
+    return new AwsCliError(403, 'AWS_ACCESS_DENIED', 'The selected AWS profile lacks permission for this AWS action.');
   }
   if (/RepositoryNotFoundException/i.test(message)) {
     return new AwsCliError(404, 'REPOSITORY_NOT_FOUND', 'This repository was not found in the selected account and Region.');
   }
   if (/ImageNotFoundException/i.test(message)) {
     return new AwsCliError(404, 'IMAGE_NOT_FOUND', 'This image was not found in the selected repository.');
+  }
+  if (/PreconditionFailed|InvalidRange|NoSuchKey/i.test(message)) {
+    return new AwsCliError(409, 'AWS_OBJECT_CHANGED',
+      'The Inspector SBOM object changed or disappeared during retrieval. Start a new export and retry.');
   }
   if (/LimitExceededException|ThrottlingException|TooManyRequestsException/i.test(message)) {
     return new AwsCliError(429, 'AWS_LIMIT', 'AWS request limit reached. Wait before trying again.');
@@ -129,9 +135,43 @@ function rolePartition(region) {
   return 'aws';
 }
 
+export function validateInspectorDestination(value, region) {
+  const bucketName = value?.bucketName;
+  const keyPrefix = value?.keyPrefix ?? '';
+  const kmsKeyArn = value?.kmsKeyArn;
+  const partition = rolePartition(region);
+  if (typeof bucketName !== 'string' || bucketName.length < 3 || bucketName.length > 63
+    || !/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(bucketName)
+    || bucketName.includes('..') || /(?:\.-|-\.)/.test(bucketName)
+    || /^\d+\.\d+\.\d+\.\d+$/.test(bucketName)) {
+    throw new AwsCliError(400, 'INVALID_INPUT', 'Enter a valid S3 bucket name for Inspector exports.');
+  }
+  if (typeof keyPrefix !== 'string' || keyPrefix.length > 512
+    || (keyPrefix && (!/^[A-Za-z0-9!_.*'()/-]+$/.test(keyPrefix)
+      || keyPrefix.startsWith('/') || keyPrefix.split('/').includes('..')))) {
+    throw new AwsCliError(400, 'INVALID_INPUT', 'Enter a simple S3 key prefix without spaces or parent-directory segments.');
+  }
+  if (typeof kmsKeyArn !== 'string' || kmsKeyArn.length > 256
+    || !new RegExp(`^arn:${partition}:kms:${region}:\\d{12}:key/[A-Za-z0-9-]{8,128}$`).test(kmsKeyArn)) {
+    throw new AwsCliError(400, 'INVALID_INPUT', 'Enter a KMS key ARN in the selected AWS Region.');
+  }
+  return { bucketName, keyPrefix, kmsKeyArn };
+}
+
 function validProfileName(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 128
     && !/[\x00-\x1f\x7f]/.test(value);
+}
+
+async function inspectorPermission(promise, code, message) {
+  try {
+    return await promise;
+  } catch (error) {
+    if (error instanceof AwsCliError && error.code === 'AWS_ACCESS_DENIED') {
+      throw new AwsCliError(403, code, message);
+    }
+    throw error;
+  }
 }
 
 function activeCredentials(record) {
@@ -185,7 +225,8 @@ export class AwsCliService {
     this.mfaAttempts = new Map();
   }
 
-  async execute(args, { json = true, allowMissingSetting = false, maxBuffer = 16 * 1024 * 1024, envOverrides = {} } = {}) {
+  async execute(args, { json = true, allowMissingSetting = false, maxBuffer = 16 * 1024 * 1024,
+    envOverrides = {}, signal, timeoutMs = 35_000 } = {}) {
     if (this.inFlight >= this.maxConcurrent) {
       throw new AwsCliError(429, 'LOCAL_BUSY', 'Too many AWS requests are in progress. Try again shortly.');
     }
@@ -194,7 +235,8 @@ export class AwsCliService {
       const { stdout } = await this.run(this.command, args, {
         shell: false,
         windowsHide: true,
-        timeout: 35_000,
+        timeout: timeoutMs,
+        signal,
         maxBuffer,
         encoding: 'utf8',
         env: Object.fromEntries(Object.entries({ ...cliEnvironment(), ...envOverrides })
@@ -427,14 +469,14 @@ export class AwsCliService {
     }
   }
 
-  async aws(profile, region, service, operation, extra = []) {
+  async aws(profile, region, service, operation, extra = [], options = {}) {
     await this.requireTarget(profile, region);
     const session = await this.sessionFor(profile);
     return this.execute([
       service, operation, ...(session ? [] : [`--profile=${profile}`]), `--region=${region}`,
       '--output=json', '--no-cli-pager', '--cli-connect-timeout=5', '--cli-read-timeout=20',
       ...extra,
-    ], { envOverrides: session ? isolatedCredentialEnvironment(session.credentials) : {} });
+    ], { ...options, envOverrides: session ? isolatedCredentialEnvironment(session.credentials) : {} });
   }
 
   async identity(profile, region) {
@@ -513,6 +555,83 @@ export class AwsCliService {
       throw new AwsCliError(404, 'IMAGE_NOT_FOUND', 'This image was not found in the selected repository.');
     }
     return item;
+  }
+
+  async createInspectorSbomExport(target, account, destination, signal) {
+    const { profile, region, repository, digest } = target;
+    validateRepository(repository);
+    validateDigest(digest);
+    if (!/^\d{12}$/.test(account)) throw new AwsCliError(400, 'INVALID_INPUT', 'The AWS account is invalid.');
+    const selected = validateInspectorDestination(destination, region);
+    const resourceId = `arn:${rolePartition(region)}:ecr:${region}:${account}:repository/${repository}/${digest}`;
+    const filter = {
+      accountId: [{ comparison: 'EQUALS', value: account }],
+      resourceId: [{ comparison: 'EQUALS', value: resourceId }],
+      resourceType: [{ comparison: 'EQUALS', value: 'AWS_ECR_CONTAINER_IMAGE' }],
+    };
+    const result = await inspectorPermission(this.aws(profile, region, 'inspector2', 'create-sbom-export', [
+      '--report-format=CYCLONEDX_1_4',
+      `--resource-filter-criteria=${JSON.stringify(filter)}`,
+      `--s3-destination=${JSON.stringify(selected)}`,
+    ], { signal }), 'INSPECTOR_CREATE_DENIED',
+    'This profile cannot start an Inspector SBOM export. Check inspector2:CreateSbomExport and Inspector write access to the S3 bucket and KMS key.');
+    if (!INSPECTOR_REPORT_ID_RE.test(result?.reportId ?? '')) {
+      throw new AwsCliError(502, 'INSPECTOR_BAD_RESPONSE', 'Inspector did not return a valid SBOM export ID.');
+    }
+    return { reportId: result.reportId, resourceId };
+  }
+
+  async getInspectorSbomExport(target, reportId, signal) {
+    if (!INSPECTOR_REPORT_ID_RE.test(reportId ?? '')) {
+      throw new AwsCliError(400, 'INVALID_INPUT', 'The Inspector SBOM export ID is invalid.');
+    }
+    const result = await inspectorPermission(this.aws(target.profile, target.region, 'inspector2', 'get-sbom-export', [
+      `--report-id=${reportId}`,
+    ], { signal }), 'INSPECTOR_STATUS_DENIED',
+    'This profile cannot read Inspector SBOM export status. Grant inspector2:GetSbomExport and retry.');
+    if (result?.reportId !== reportId || !['IN_PROGRESS', 'SUCCEEDED', 'FAILED', 'CANCELLED'].includes(result.status)) {
+      throw new AwsCliError(502, 'INSPECTOR_BAD_RESPONSE', 'Inspector returned an unexpected SBOM export status.');
+    }
+    return result;
+  }
+
+  async listInspectorSbomObject(target, destination, signal) {
+    const result = await inspectorPermission(this.aws(target.profile, target.region, 's3api', 'list-objects-v2', [
+      `--bucket=${destination.bucketName}`, `--prefix=${destination.keyPrefix}`, '--max-keys=2', '--no-paginate',
+    ], { signal }), 'INSPECTOR_S3_LIST_DENIED',
+    'This profile cannot list the Inspector export prefix. Grant s3:ListBucket on the export bucket for this prefix.');
+    const objects = result?.Contents ?? [];
+    if (result?.IsTruncated || !Array.isArray(objects) || objects.length !== 1) {
+      throw new AwsCliError(422, 'INSPECTOR_EXPORT_AMBIGUOUS',
+        'The Inspector export prefix does not contain exactly one SBOM object. Use a clean bucket prefix and retry.');
+    }
+    const object = objects[0];
+    if (typeof object?.Key !== 'string' || !object.Key.startsWith(destination.keyPrefix)
+      || object.Key.length > 1024 || !Number.isInteger(object.Size) || object.Size <= 0
+      || !/^"[^"\x00-\x1f\x7f]{1,128}"$/.test(object.ETag ?? '')) {
+      throw new AwsCliError(502, 'INSPECTOR_EXPORT_INVALID', 'Inspector returned an invalid SBOM object listing.');
+    }
+    if (object.Size > INSPECTOR_MAX_SBOM_BYTES) {
+      throw new AwsCliError(413, 'SBOM_TOO_LARGE', 'The Inspector SBOM exceeds the 16 MiB local import limit.');
+    }
+    return { key: object.Key, etag: object.ETag, size: object.Size };
+  }
+
+  async downloadInspectorSbomObject(target, destination, object, outputPath, signal) {
+    if (!object || typeof object.key !== 'string' || !object.key.startsWith(destination.keyPrefix)
+      || typeof outputPath !== 'string' || !outputPath) {
+      throw new AwsCliError(400, 'INVALID_INPUT', 'The Inspector SBOM object selection is invalid.');
+    }
+    const result = await inspectorPermission(this.aws(target.profile, target.region, 's3api', 'get-object', [
+      `--bucket=${destination.bucketName}`, `--key=${object.key}`, `--if-match=${object.etag}`,
+      `--range=bytes=0-${INSPECTOR_MAX_SBOM_BYTES}`, outputPath,
+    ], { signal, maxBuffer: 64 * 1024, timeoutMs: 90_000 }), 'INSPECTOR_S3_READ_DENIED',
+    'This profile cannot read or decrypt the Inspector SBOM. Grant s3:GetObject for the export prefix and kms:Decrypt on its KMS key.');
+    if (result?.ETag !== object.etag || result?.ContentLength !== object.size) {
+      throw new AwsCliError(502, 'INSPECTOR_EXPORT_CHANGED',
+        'The Inspector SBOM object changed during retrieval. The local copy was rejected.');
+    }
+    return result;
   }
 
   // The in-app MFA session takes priority when present. Otherwise AWS CLI

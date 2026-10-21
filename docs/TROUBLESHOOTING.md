@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Start with the error shown in Sentinel. Most failures are scoped to one profile, Region, network path, image, or SBOM. The app does not need ECR managed scanning or Amazon Inspector enabled.
+Start with the error shown in Sentinel. Most failures are scoped to one profile, Region, network path, image, or SBOM. Direct scans and manual SBOM imports do not need Inspector; the Inspector SBOM option requires that Enhanced Scanning already covers the image.
 
 ## Startup and browser session
 
@@ -37,7 +37,7 @@ The app intentionally returns short user-facing errors instead of raw AWS CLI st
 | --- | --- |
 | Scanner unavailable or `TRIVY_UNSAFE_VERSION` | Install or update Trivy to a trusted stable version 0.71.1 or newer, verify `trivy --version`, then select **Check again**. |
 | `TRIVY_DB_UNAVAILABLE` | Permit the configured Trivy database registries, including `mirror.gcr.io` and `ghcr.io`, through the network route. Retry after connectivity returns. First use may download multiple gigabytes including the Java database. |
-| Repositories/images appear, but direct scan returns `ECR_PULL_DENIED` | The Mac can read metadata but cannot pull. The selected identity needs the registry token and image pull actions, plus ECR registry/S3 network access. If the restriction is intentional, use a build-host SBOM instead. |
+| Repositories/images appear, but direct scan returns `ECR_PULL_DENIED` | The Mac can read metadata but cannot pull. The selected identity needs the registry token and image pull actions, plus ECR registry/S3 network access. If the restriction is intentional, use an Inspector export for an already monitored image or import an approved build-host SBOM. |
 | `SCAN_NETWORK` | Check VPN, DNS, the ECR registry endpoint, S3 image-layer route, and database connectivity. ECR API access alone is insufficient for a direct pull. |
 | `IMAGE_NOT_FOUND` or `REPOSITORY_NOT_FOUND` | Refresh inventory and verify the account, Region, and digest. Tags may have moved or images may have been deleted. |
 | `IMAGE_ARCHIVED` | Restore the image in ECR using your organization's normal process before direct scanning. |
@@ -64,3 +64,17 @@ The scanner uses a local cache under the user's temporary directory. If the cach
 | `SBOM_SCAN_FAILED` | Check the bundle format, Trivy version, database access, and local disk space. |
 
 See [the build-host workflow](BUILD_HOST_SBOM.md) for exact generation order and the [security audit](../SECURITY_AUDIT.md) for unsigned provenance and coverage limitations.
+
+## Inspector SBOM export
+
+| Symptom | Recovery |
+| --- | --- |
+| Inspector reports that the resource is unavailable or export fails | Confirm Enhanced Scanning covers the **exact digest** in the selected account and Region. Archived, removed, or unmonitored images cannot provide an Inspector SBOM. |
+| `AccessDenied` when creating or checking the export | Check `inspector2:CreateSbomExport` and `inspector2:GetSbomExport` for the selected profile, plus SCPs and permission boundaries. Verify the approved bucket/KMS service policies. |
+| Export succeeds but S3 retrieval is denied | Check prefix-scoped `s3:ListBucket`, `s3:GetObject`, `kms:Decrypt`, bucket policy, key policy, and S3 endpoint connectivity for the selected profile. |
+| Destination rejected | Use an approved private bucket and customer-managed symmetric KMS key in the image's Region. Ask the AWS team to configure Inspector service write/encrypt rights using AWS's policy examples. |
+| Exported SBOM does not match the selected digest or platform | Refresh inventory and select the exact platform child digest. A multi-platform index and child image may have different digests. Do not manually alter the SBOM metadata. |
+| Export wait times out or local job is canceled | Inspector can continue its remote export after the local job stops. Check the bucket's lifecycle policy and retry with the correct image and permissions. |
+| Trivy shows zero findings or no package targets | Review the SBOM component count and coverage warning. A third-party SBOM may not have the properties Trivy uses for its most precise matching. |
+
+See [Inspector setup](INSPECTOR_SBOM.md) for a caller policy, S3/KMS prerequisites, and coverage limits.
